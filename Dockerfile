@@ -14,6 +14,11 @@ ARG YQ_VERSION=latest
 ARG RALPHEX_VERSION=latest
 ARG CODEX_VERSION=latest
 
+# Без pipefail в конвейере вида `curl ... | bash` падение curl остаётся незамеченным:
+# статус берётся от последней команды, и в образ приезжает молча недоустановленный
+# инструмент. Явный bash нужен потому, что у dash такой опции нет.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Базовый dev-тулинг + SSH (сервер для входа с Mac, клиент для выхода на OMV-хост).
 # Состав зафиксирован в BASE-KIT.md — там же, почему каждая вещь здесь.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -77,8 +82,7 @@ RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     tag="$YQ_VERSION"; \
     if [ "$tag" = latest ]; then \
-      tag="$(curl -fsSL https://api.github.com/repos/mikefarah/yq/releases/latest \
-             | grep -m1 '"tag_name"' | cut -d'"' -f4)"; \
+      tag="$(curl -fsSL https://api.github.com/repos/mikefarah/yq/releases/latest | jq -r .tag_name)"; \
     fi; \
     base="https://github.com/mikefarah/yq/releases/download/${tag}"; \
     cd /tmp; \
@@ -100,8 +104,7 @@ RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     tag="$RALPHEX_VERSION"; \
     if [ "$tag" = latest ]; then \
-      tag="$(curl -fsSL https://api.github.com/repos/umputun/ralphex/releases/latest \
-             | grep -m1 '"tag_name"' | cut -d'"' -f4)"; \
+      tag="$(curl -fsSL https://api.github.com/repos/umputun/ralphex/releases/latest | jq -r .tag_name)"; \
     fi; \
     ver="${tag#v}"; \
     base="https://github.com/umputun/ralphex/releases/download/${tag}"; \
