@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# cdev — панель dev-контейнеров Claude Code на OMV (Mac).
+# Тонкий клиент: по SSH дёргает /usr/local/bin/claude-dev-ctl на хосте.
+# Требует: fzf, рабочий ssh-алиас "omv".
+set -uo pipefail
+
+SSH_HOST=${CDEV_SSH_HOST:-omv}
+HOST_IP=${CDEV_HOST_IP:-192.168.0.100}
+KEY="${CDEV_KEY:-$HOME/.ssh/id_ed25519}"
+CTL="ssh $SSH_HOST /usr/local/bin/claude-dev-ctl"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# Всё, что уходит в `ssh host "команда '$x'"`, склеивается в строку и разбирается
+# шеллом на той стороне: одна кавычка в аргументе — и это уже чужая команда на
+# хосте. Проверяем аргументы здесь, до склейки, а не надеемся на проверку внутри.
+valid_name() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+valid_cname() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; }
+valid_port() { [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && [ "${1}" -ge 1 ] && [ "${1}" -le 65535 ]; }
+
+# В macOS штатный /usr/bin/rsync — это openrsync (совместим с 2.6.9): он не понимает
+# --info/--progress и dry-run с --exclude. Нужен GNU rsync 3.x (как в контейнере),
+# причём искать его надо явно: /usr/bin обычно идёт в PATH раньше /opt/homebrew/bin.
+# Каждый контейнер генерирует свои SSH host-ключи. Если на порт приезжает новый
+# контейнер (пересоздание с --purge или другой проект на том же порту), старая запись
+# в known_hosts вызывает "REMOTE HOST IDENTIFICATION HAS CHANGED". Чистим её ТОЛЬКО
+# когда контейнер создали/удалили мы сами — при обычном подключении предупреждение
+# должно остаться, там оно означает ровно то, что написано.
+forget_host_key() {
+  [ -n "${1:-}" ] || return 0
+  ssh-keygen -R "[$HOST_IP]:$1" >/dev/null 2>&1 || true
+}
+
+pick_rsync() {
+  local c ver
+  for c in /opt/homebrew/bin/rsync /usr/local/bin/rsync "$(command -v rsync 2>/dev/null)"; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    # версию берём в переменную: конвейер с head даёт SIGPIPE (код 141), и под
+    # `set -o pipefail` условие вида `... | head | grep` всегда считалось бы ложным
+    ver=$("$c" --version 2>/dev/null | head -1) || true
+    case "$ver" in
+      rsync*version\ 3*) echo "$c"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+case "${1:-}" in
+  --connect)  # $2 = имя контейнера → ssh + tmux
+    name=${2:-}
+    [ -z "$name" ] && exit 0
+    valid_cname "$name" || { echo "Недопустимое имя контейнера: $name"; sleep 1.5; exit 1; }
+    port=$(ssh "$SSH_HOST" "/usr/local/bin/claude-dev-ctl port $name")
+    if [ -z "$port" ]; then echo "Контейнер $name не запущен."; sleep 1.5; exit 0; fi
+    # -c /workspace: сессия стартует в коде, а не в $HOME (там ключи и креды)
+    exec ssh -t -i "$KEY" -o StrictHostKeyChecking=accept-new -p "$port" dev@"$HOST_IP" \
+      'tmux new -A -s work -c /workspace'
+    ;;
+
+  --deploy)   # интерактивно развернуть новый
+    # ВАЖНО: под fzf наш stdin — это пайп со списком (уже в EOF), поэтому read
+    # мгновенно возвращал пустоту и деплой молча отменялся. Берём ввод с терминала.
+    if (exec < /dev/tty) 2>/dev/null; then exec < /dev/tty; fi
+    echo "── Новый dev-контейнер ──"
+    read -rp "Имя проекта (строчные [a-z0-9-]): " name
+    if [ -z "$name" ]; then echo "Имя не задано — отмена."; sleep 1.5; exit 0; fi
+    if ! valid_name "$name"; then
+      echo "Имя должно быть из [a-z0-9-] и начинаться с буквы или цифры — отмена."
+      sleep 2; exit 0
+    fi
+    read -rp "SSH-порт [2202]: " port; port=${port:-2202}
+    if ! valid_port "$port"; then echo "Порт должен быть числом 1..65535 — отмена."; sleep 2; exit 0; fi
+    echo "Разворачиваю dev-$name на :$port …"
+    if ssh -n "$SSH_HOST" "/usr/local/bin/claude-dev-ctl deploy '$name' '$port'"; then
+      # контейнер только что создан нами — его host-ключ новый и легитимный
+      forget_host_key "$port"
+      echo "Готово."
+    else
+      echo "!! Не удалось развернуть dev-$name — см. сообщение выше."
+    fi
+    echo; echo "Enter — вернуться в панель"; read -r _
+    ;;
+
+  --upload)   # $2 = имя контейнера: залить локальную папку/файл в /workspace
+    name=${2:-}
+    [ -z "$name" ] && exit 0
+    valid_cname "$name" || { echo "Недопустимое имя контейнера: $name"; sleep 1.5; exit 1; }
+    if (exec < /dev/tty) 2>/dev/null; then exec < /dev/tty; fi
+    port=$(ssh -n "$SSH_HOST" "/usr/local/bin/claude-dev-ctl port $name")
+    if [ -z "$port" ]; then echo "Контейнер $name не запущен."; sleep 1.5; exit 0; fi
+
+    echo "── Загрузка в $name:/workspace ──"
+    RS=$(pick_rsync) || RS=""
+    if [ -z "$RS" ]; then
+      echo "Нужен GNU rsync 3.x — системный openrsync не подходит."
+      read -rp "Установить через brew? [Y/n]: " a
+      if [ "$a" != "n" ] && [ "$a" != "N" ]; then
+        brew install rsync && RS=$(pick_rsync) || RS=""
+      fi
+      if [ -z "$RS" ]; then echo "Без GNU rsync загрузка невозможна."; sleep 2.5; exit 0; fi
+    fi
+
+    echo "Путь на Mac. Можно перетащить папку из Finder, Tab — автодополнение."
+    read -e -rp "Путь: " src
+    # Finder при перетаскивании экранирует пробелы и может обрамлять кавычками
+    src=${src%\'}; src=${src#\'}; src=${src%\"}; src=${src#\"}
+    src=${src//\\ / }
+    src=${src/#\~/$HOME}
+    [ -z "$src" ] && { echo "Отмена."; sleep 1; exit 0; }
+    if [ ! -e "$src" ]; then echo "Нет такого пути: $src"; sleep 2.5; exit 0; fi
+    src=${src%/}          # без хвостового слэша: кладём саму папку внутрь /workspace
+
+    echo
+    echo "  откуда : $src  ($(du -sh "$src" 2>/dev/null | cut -f1))"
+    echo "  куда   : $name:/workspace/$(basename "$src")"
+    read -rp "Пропустить мусор (node_modules, .venv, __pycache__, dist, build)? [Y/n]: " skip
+    EXC=()
+    if [ "$skip" != "n" ] && [ "$skip" != "N" ]; then
+      for p in node_modules .venv venv __pycache__ .pytest_cache .DS_Store dist build .next target; do
+        EXC+=(--exclude="$p")
+      done
+      echo "  (.git сохраняется — историю не выбрасываем)"
+    fi
+    SSHCMD="ssh -p $port -i $KEY -o StrictHostKeyChecking=accept-new"
+    # предпросмотр: сколько реально поедет (с GNU rsync dry-run работает и с --exclude)
+    n=$("$RS" -azn --stats ${EXC[@]+"${EXC[@]}"} -e "$SSHCMD" \
+          "$src" "dev@$HOST_IP:/workspace/" 2>/dev/null \
+        | awk -F': *' '/Number of regular files transferred/ {print $2}')
+    [ -n "${n:-}" ] && echo "  к передаче: $n файл(ов)"
+
+    read -rp "Заливаем? [Y/n]: " go
+    if [ "$go" = "n" ] || [ "$go" = "N" ]; then echo "Отмена."; sleep 1; exit 0; fi
+
+    echo
+    if "$RS" -az --info=progress2 --human-readable ${EXC[@]+"${EXC[@]}"} \
+         -e "$SSHCMD" "$src" "dev@$HOST_IP:/workspace/"; then
+      echo
+      echo "Готово. Сейчас в /workspace:"
+      ssh -n -i "$KEY" -o StrictHostKeyChecking=accept-new -p "$port" dev@"$HOST_IP" 'ls -la /workspace'
+    else
+      echo "!! Не удалось залить — см. сообщение выше."
+    fi
+    echo; echo "Enter — вернуться в панель"; read -r _
+    ;;
+
+  --delete)   # $2 = имя контейнера
+    name=${2:-}
+    [ -z "$name" ] && exit 0
+    valid_cname "$name" || { echo "Недопустимое имя контейнера: $name"; sleep 1.5; exit 1; }
+    # ввод с терминала, а не из унаследованного пайпа fzf
+    if (exec < /dev/tty) 2>/dev/null; then exec < /dev/tty; fi
+    # порт узнаём ДО удаления — потом контейнера уже не будет
+    port=$(ssh -n "$SSH_HOST" "/usr/local/bin/claude-dev-ctl port $name" 2>/dev/null)
+    echo "── Удаление $name ──"
+    echo "  1) только контейнер  (тома с кодом/логином СОХРАНИТЬ)"
+    echo "  2) контейнер + тома  (код, логин, ключи — БЕЗВОЗВРАТНО)"
+    echo "  q) отмена"
+    read -rp "> " ans
+    case "$ans" in
+      1) ssh -n "$SSH_HOST" "/usr/local/bin/claude-dev-ctl rm '$name'" && forget_host_key "$port" ;;
+      2) read -rp "Впиши слово УДАЛИТЬ для подтверждения: " c
+         if [ "$c" = "УДАЛИТЬ" ]; then
+           ssh -n "$SSH_HOST" "/usr/local/bin/claude-dev-ctl rm '$name' --purge" && forget_host_key "$port"
+         else echo "отмена"; fi ;;
+      *) echo "отмена" ;;
+    esac
+    echo; echo "Enter — вернуться в панель"; read -r _
+    ;;
+
+  *)          # основной экран
+    command -v fzf >/dev/null 2>&1 || { echo "Нужен fzf: brew install fzf"; exit 1; }
+    $CTL list | fzf --reverse --no-sort --header-lines=1 \
+      --preview "ssh $SSH_HOST /usr/local/bin/claude-dev-ctl inspect {1}" \
+      --preview-window 'right,56%,wrap' \
+      --header 'enter:подключиться  ^n:новый  ^u:залить файлы  ^d:удалить  ^t:токены  ^r:обновить  esc:выход' \
+      --bind "enter:become($SELF --connect {1})" \
+      --bind "ctrl-r:reload($CTL list)" \
+      --bind "ctrl-t:change-preview(ssh $SSH_HOST /usr/local/bin/claude-dev-ctl inspect {1} --tokens)" \
+      --bind "ctrl-n:execute($SELF --deploy)+reload($CTL list)" \
+      --bind "ctrl-u:execute($SELF --upload {1})+reload($CTL list)" \
+      --bind "ctrl-d:execute($SELF --delete {1})+reload($CTL list)"
+    ;;
+esac

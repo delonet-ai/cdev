@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:arcane.ofkm.dev)",
+      "WebFetch(domain:developers.openai.com)",
+      "Bash(shellcheck:*)",
+      "Bash(bash -n:*)",
+      "Bash(docker build:*)"
+    ],
+    "deny": [
+      "Read(./**/auth.json)",
+      "Read(./**/claude-credentials.json)",
+      "Read(./**/*_token)"
+    ]
+  }
+}

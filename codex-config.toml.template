@@ -1,0 +1,13 @@
+# ~/.codex/config.toml в dev-контейнере __CONTAINER__.
+# Засевается claude-dev-ctl при deploy/retrofit — правки здесь переживают
+# пересоздание контейнера, правки внутри контейнера нет.
+
+# Модель ревью. Держи её согласованной с codex_model в ~/.config/ralphex/config:
+# ralphex передаёт свою модель флагом, а этот файл задаёт дефолт для ручных вызовов.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+
+# Ревьюер ничего не должен менять: он читает диф и пишет замечания.
+# Запись и сеть открываются осознанно и вручную, а не дефолтом.
+sandbox_mode = "read-only"
+approval_policy = "never"

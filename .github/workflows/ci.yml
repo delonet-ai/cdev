@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Скрипты — единственный исполняемый код в репозитории, поэтому линтер здесь
+      # и есть тест. Тот же shellcheck стоит в образе: гейт, который проходит в CI,
+      # но не запускается в контейнере, останавливает автономный цикл ralphex.
+      - name: Run shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck --severity=warning arcane entrypoint.sh tui/cdev tui/claude-dev-ctl
+
+  dockerfile:
+    name: hadolint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          # DL3008/DL3018: версии apt-пакетов намеренно не пиним — образ пересобирается
+          # редко, и свежие обновления безопасности здесь важнее байт-в-байт повтора.
+          # SC2086 внутри RUN: слова разбиваются намеренно.
+          ignore: DL3008,DL3059,SC2086
+
+  compose:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose template
+        run: docker compose -f docker-compose.yml config --quiet
+
+  build:
+    name: docker build
+    runs-on: ubuntu-latest
+    # Сборка тянет релизы с GitHub и ставит npm-пакеты — в PR из форков это лишний
+    # сетевой трафик и лишние минуты, поэтому только на своей ветке.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t omv/claude-dev:ci .
+      - name: Smoke-test toolchain
+        run: |
+          docker run --rm --entrypoint sh omv/claude-dev:ci -c '
+            set -eux
+            codex --version
+            ralphex --version
+            yq --version
+            gh --version
+            docker --version
+            shellcheck --version
+            arcane | head -3
+          '

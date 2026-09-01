@@ -1,0 +1,24 @@
+# Никаких ключей и секретов в git.
+*.pem
+*.key
+id_*
+!ssh_config.example
+authorized_keys
+mac_authorized_key
+known_hosts
+host_keys/
+.env
+
+# Креды и токены, которые кит раскладывает по контейнерам.
+# Живут только на хосте, в /root/claude-dev-build.
+claude-credentials.json
+codex-auth.json
+auth.json
+*_token
+*.token
+
+# Локальные настройки Claude Code — у каждого свои.
+.claude/settings.local.json
+
+# Мусор macOS.
+.DS_Store

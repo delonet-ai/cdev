@@ -1,0 +1,19 @@
+# Добавь этот блок в ~/.ssh/config на Mac.
+# <ip-OMV> — адрес сервера OMV в LAN (например 192.168.1.50).
+# id_omv_dev — приватный ключ Mac, чей публичный ключ лежит в authorized_keys контейнера.
+
+Host omv-dev-projectA
+    HostName <ip-OMV>
+    Port 2201
+    User dev
+    IdentityFile ~/.ssh/id_omv_dev
+    # Держим соединение живым при переключении Wi-Fi/сна:
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+
+# Для остальных проектов — копия блока с другим портом:
+# Host omv-dev-projectB
+#     HostName <ip-OMV>
+#     Port 2202
+#     User dev
+#     IdentityFile ~/.ssh/id_omv_dev

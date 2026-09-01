@@ -1,0 +1,17 @@
+# ~/.config/ralphex/config в dev-контейнере __CONTAINER__ (INI).
+# Засевается claude-dev-ctl при deploy/retrofit.
+#
+# Фаза внешнего ревью включена: план выполняет Claude Code, найденное перепроверяет
+# codex — независимая модель ловит то, на что у автора замылен глаз.
+# Если codex не авторизован (нет ~/.codex/auth.json), поставь codex_enabled = false,
+# иначе цикл будет спотыкаться на каждой фазе ревью.
+
+external_review_tool = codex
+codex_enabled = true
+codex_command = codex
+codex_model = gpt-5.6-sol
+codex_reasoning_effort = high
+codex_sandbox = read-only
+
+# Планы лежат в репозитории проекта, а не в $HOME.
+plans_dir = docs/plans

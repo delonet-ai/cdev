@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# arcane — обёртка над Arcane API для работы из dev-контейнера Claude Code.
+#
+# Разделение обязанностей:
+#   контейнеры (ps/logs/restart) — обычный docker CLI, он и так смотрит на сервер
+#                                  через DOCKER_HOST=ssh://deployer@<хост>;
+#   проекты (стеки)              — Arcane REST API, docker CLI про них не знает.
+#
+# Токен: ~/.arcane_token (засевается при deploy). URL/окружение переопределяются
+# переменными ARCANE_URL / ARCANE_ENV.
+set -uo pipefail
+
+: "${ARCANE_URL:=http://192.168.0.100:3552}"
+: "${ARCANE_ENV:=0}"                       # id окружения Arcane; 0 = локальный docker
+TOKEN_FILE="${ARCANE_TOKEN_FILE:-$HOME/.arcane_token}"
+
+need_token() {
+  [ -f "$TOKEN_FILE" ] && return 0
+  echo "Нет токена Arcane: $TOKEN_FILE" >&2
+  echo "Он засевается при создании контейнера (claude-dev-ctl deploy/retrofit)." >&2
+  echo "Сам токен создаётся в UI: Settings -> API keys." >&2
+  exit 1
+}
+
+api() { # METHOD PATH [curl-args...]
+  local method=$1 path=$2; shift 2
+  need_token
+  curl -sS --fail-with-body -X "$method" \
+    -H "X-API-Key: $(cat "$TOKEN_FILE")" \
+    -H 'Content-Type: application/json' \
+    "$@" "$ARCANE_URL$path"
+}
+
+env_api() { # METHOD SUBPATH [curl-args...]  — путь внутри текущего окружения
+  local method=$1 path=$2; shift 2
+  api "$method" "/api/environments/$ARCANE_ENV$path" "$@"
+}
+
+project_id() { # по имени проекта -> id
+  env_api GET "/projects?limit=500" \
+    | jq -r --arg n "$1" '.data[]? | select(.name==$n or .dirName==$n) | .id' | head -1
+}
+
+need() { [ -n "${1:-}" ] || { echo "Не найдено: ${2:-объект}" >&2; exit 1; }; }
+
+# Действие над проектом без тела запроса: up/down/restart/pull/redeploy.
+project_action() { # ACTION NAME [json-body]
+  local action=$1 name=${2:?имя проекта} body=${3:-} id
+  id=$(project_id "$name"); need "$id" "проект $name"
+  if [ -n "$body" ]; then
+    env_api POST "/projects/$id/$action" --data-binary "$body" >/dev/null
+  else
+    env_api POST "/projects/$id/$action" >/dev/null
+  fi
+}
+
+case "${1:-}" in
+  projects|stacks)
+    env_api GET "/projects?limit=500" \
+      | jq -r '["NAME","STATUS","SERVICES","RUNNING"],
+               (.data[]? | [.name, .status, (.serviceCount|tostring), (.runningCount|tostring)])
+               | @tsv' | column -t -s $'\t'
+    ;;
+
+  project|stack)
+    id=$(project_id "${2:?имя проекта}"); need "$id" "проект ${2}"
+    env_api GET "/projects/$id" \
+      | jq '.data | {id, name, status, statusReason, serviceCount, runningCount, path, isArchived}'
+    ;;
+
+  compose)   # показать compose-файл проекта
+    id=$(project_id "${2:?имя проекта}"); need "$id" "проект ${2}"
+    env_api GET "/projects/$id/compose" | jq -r '.data.composeContent'
+    ;;
+
+  env)       # показать .env проекта (значения секретов тут реальные — не выводи в чат лишний раз)
+    id=$(project_id "${2:?имя проекта}"); need "$id" "проект ${2}"
+    env_api GET "/projects/$id/compose" | jq -r '.data.envContent // ""'
+    ;;
+
+  ps)        # контейнеры сервера — через docker CLI (DOCKER_HOST смотрит на хост)
+    docker ps -a --format 'table {{.Names}}\t{{.State}}\t{{.Status}}\t{{.Image}}'
+    ;;
+
+  logs)
+    docker logs --tail "${3:-100}" "${2:?имя контейнера}" 2>&1
+    ;;
+
+  restart|start|stop)
+    docker "$1" "${2:?имя контейнера}" >/dev/null \
+      && echo "$1: $2 — ок" || { echo "$1: $2 — не удалось" >&2; exit 1; }
+    ;;
+
+  up)        project_action up       "${2:-}" '{"forceRecreate":false}' && echo "up: $2 — ок" ;;
+  down)      project_action down     "${2:-}"                           && echo "down: $2 — ок" ;;
+  pull)      project_action pull     "${2:-}"                           && echo "pull: $2 — ок" ;;
+  redeploy)  project_action redeploy "${2:-}" '{"pullImages":true}'     && echo "redeploy: $2 — ок" ;;
+
+  api)       # произвольный запрос: arcane api GET /api/environments/0/projects
+    api "${2:?METHOD}" "${3:?/path}" "${@:4}"
+    ;;
+
+  *)
+    cat <<'HELP'
+arcane — управление проектами/контейнерами на сервере через Arcane API
+
+  arcane projects                  список проектов (стеков)
+  arcane project <имя>             сводка по проекту
+  arcane compose <имя>             compose-файл проекта
+  arcane env <имя>                 .env проекта
+  arcane up|down|pull <имя>        поднять / погасить / подтянуть образы
+  arcane redeploy <имя>            пере-развернуть (с pull образов)
+
+  arcane ps                        контейнеры на сервере (через docker)
+  arcane logs <контейнер> [N]      последние N строк логов (по умолчанию 100)
+  arcane restart|start|stop <контейнер>
+
+  arcane api <METHOD> <path>       произвольный запрос к API
+
+Схема API: <ARCANE_URL>/api/docs   (по умолчанию http://192.168.0.100:3552/api/docs)
+HELP
+    ;;
+esac

@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# claude-dev-ctl — управление dev-контейнерами Claude Code на OMV.
+# Живёт на хосте (/usr/local/bin/claude-dev-ctl). Вызывается по SSH из Mac-утилиты cdev.
+# Приватные ключи и креды не покидают хост.
+#
+# Стеки поднимаются обычным `docker compose`, а compose-файлы кладутся в каталог
+# проектов Arcane — так контейнер и управляется штатно, и виден в UI. Отдельного
+# API для создания стека не нужно: на хосте и так есть настоящий docker.
+set -uo pipefail
+
+IMAGE=omv/claude-dev:latest
+HOST_IP=${OMV_HOST:-192.168.0.100}
+BUILD_DIR=${CLAUDE_DEV_BUILD_DIR:-/root/claude-dev-build}
+
+MACKEY_FILE=$BUILD_DIR/mac_authorized_key
+DEPLOYKEY=$BUILD_DIR/keys/id_dev_to_omv
+GITHUBKEY=$BUILD_DIR/keys/id_github                    # общий ключ для git clone/push
+CREDS_FILE=$BUILD_DIR/claude-credentials.json          # мастер-креды Claude (только на хосте, не в git!)
+CODEX_AUTH_FILE=$BUILD_DIR/codex-auth.json             # мастер-креды codex (~/.codex/auth.json)
+ATOKEN_FILE=$BUILD_DIR/arcane_container_token          # общий Arcane-токен для dev-контейнеров
+CLAUDEMD_TPL=$BUILD_DIR/CLAUDE.md.template             # контекст ландшафта для Claude
+CODEX_TPL=$BUILD_DIR/codex-config.toml.template        # настройки codex как ревьюера
+RALPHEX_TPL=$BUILD_DIR/ralphex-config.template         # настройки автономного цикла
+SKILLS_DIR=$BUILD_DIR/skills                           # скиллы Claude Code для контейнеров
+
+# Каталог проектов Arcane. Лежит в его томе с данными; спрашиваем docker, а не
+# зашиваем путь: у другой установки том называется иначе или смонтирован с хоста.
+projects_dir() {
+  if [ -n "${ARCANE_PROJECTS_DIR:-}" ]; then echo "$ARCANE_PROJECTS_DIR"; return; fi
+  local mp
+  mp=$(docker volume inspect "${ARCANE_DATA_VOLUME:-arcane_arcane-data}" \
+         --format '{{.Mountpoint}}' 2>/dev/null)
+  if [ -n "$mp" ]; then echo "$mp/projects"; else echo "$BUILD_DIR/projects"; fi
+}
+
+managed_names() { # dev-контейнеры: по label claude.dev.managed или по имени dev-*
+  docker ps -a --format '{{.Names}}|{{.Label "claude.dev.managed"}}' \
+    | awk -F'|' '$1 ~ /^dev-/ || $2=="true" {print $1}' | sort -u
+}
+
+port_of() {
+  docker inspect -f '{{range $p,$c := .NetworkSettings.Ports}}{{if eq $p "22/tcp"}}{{(index $c 0).HostPort}}{{end}}{{end}}' "$1" 2>/dev/null
+}
+
+agents_info() { # печатает "count working"  (working=1 если какой-то claude грузит CPU)
+  docker exec "$1" bash -lc 'ps -eo pcpu,comm= 2>/dev/null | awk "\$2==\"claude\"{c++; if(\$1>5)w=1} END{print (c+0), (w+0)}"' 2>/dev/null || echo "0 0"
+}
+
+git_short() { # краткая сводка git-проектов в /workspace, через запятую
+  docker exec -u dev "$1" bash -lc '
+    for d in /workspace/*/; do
+      [ -d "$d/.git" ] || continue
+      b=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)
+      nm=$(basename "$d")
+      if [ -n "$(git -C "$d" status --porcelain 2>/dev/null | head -1)" ]; then
+        echo "$nm:$b*"; else echo "$nm:$b"; fi
+    done | paste -sd, -
+  ' 2>/dev/null
+}
+
+cmd_list() {
+  printf '%-18s %-9s %-6s %-7s %s\n' NAME STATUS PORT AGENTS GIT
+  local n st pt ag work info g
+  for n in $(managed_names); do
+    st=$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo gone)
+    pt=$(port_of "$n"); pt=${pt:-–}
+    if [ "$st" = running ]; then
+      info=$(agents_info "$n"); ag=${info% *}; work=${info#* }
+      [ "$work" = 1 ] && ag="${ag}▶"
+      g=$(git_short "$n"); g=${g:-–}
+    else
+      ag=0; g=–
+    fi
+    printf '%-18s %-9s %-6s %-7s %s\n' "$n" "$st" "$pt" "$ag" "$g"
+  done
+}
+
+cmd_port() { port_of "$1"; }
+
+cmd_inspect() {
+  local n=$1 tokens=${2:-} st pt
+  st=$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo gone)
+  pt=$(port_of "$n")
+  echo "▐ $n    [$st]    port ${pt:-–}"
+  echo
+  if [ "$st" != running ]; then echo "(контейнер не запущен)"; return; fi
+
+  echo "Агенты (процессы claude):"
+  local body
+  body=$(docker exec "$n" bash -lc 'ps -eo pid,pcpu,pmem,etime,comm 2>/dev/null | awk "NR==1 || \$5==\"claude\""' 2>/dev/null)
+  if [ "$(echo "$body" | wc -l)" -le 1 ]; then echo "  нет запущенных сессий"; else echo "$body" | sed 's/^/  /'; fi
+  echo
+
+  echo "Workspace (/workspace):"
+  docker exec -u dev "$n" bash -lc '
+    found=0
+    for d in /workspace/*/; do
+      [ -e "$d" ] || continue
+      nm=$(basename "$d"); found=1
+      if [ -d "$d/.git" ]; then
+        b=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)
+        dirty=$(git -C "$d" status --porcelain 2>/dev/null | wc -l)
+        ahead=$(git -C "$d" rev-list --count @{u}..HEAD 2>/dev/null)
+        line=$(printf "  %-18s %s" "$nm" "${b:-?}")
+        [ "${dirty:-0}" -gt 0 ] && line="$line  *${dirty} изм."
+        [ -n "$ahead" ] && [ "$ahead" != 0 ] && line="$line  ↑${ahead}"
+        echo "$line"
+      else
+        echo "  $nm  (не git)"
+      fi
+    done
+    [ $found = 0 ] && echo "  пусто — склонируй проект в /workspace"
+  ' 2>/dev/null
+  echo
+  # Авторизация ревьюера: без неё ralphex спотыкается на фазе внешнего ревью,
+  # и узнать об этом лучше здесь, а не посреди ночного автономного прогона.
+  if docker exec -u dev "$n" test -s /home/dev/.codex/auth.json 2>/dev/null; then
+    echo "Ревьюер: codex авторизован"
+  else
+    echo "Ревьюер: codex БЕЗ авторизации (claude-dev-ctl save-codex-auth <контейнер>)"
+  fi
+  echo "Ресурсы: $(docker stats --no-stream --format 'cpu {{.CPUPerc}}  mem {{.MemUsage}}' "$n" 2>/dev/null)"
+  echo "SSH:     ssh -p ${pt:-2201} dev@$HOST_IP"
+
+  if [ "$tokens" = "--tokens" ]; then
+    echo
+    echo "Токены (последняя сессия, best-effort):"
+    docker exec -u dev "$n" node -e '
+      const fs=require("fs"),path=require("path"),os=require("os");
+      const base=path.join(os.homedir(),".claude","projects");
+      let files=[];
+      try{for(const d of fs.readdirSync(base)){const p=path.join(base,d);for(const f of fs.readdirSync(p)){if(f.endsWith(".jsonl"))files.push(path.join(p,f));}}}catch(e){}
+      if(!files.length){console.log("  нет данных (ещё не было сессий)");process.exit(0);}
+      files.sort((a,b)=>fs.statSync(b).mtimeMs-fs.statSync(a).mtimeMs);
+      const f=files[0];let ti=0,to=0,cc=0,cr=0;
+      for(const line of fs.readFileSync(f,"utf8").split("\n")){if(!line.trim())continue;try{const j=JSON.parse(line);const u=j.message&&j.message.usage;if(u){ti+=u.input_tokens||0;to+=u.output_tokens||0;cc+=u.cache_creation_input_tokens||0;cr+=u.cache_read_input_tokens||0;}}catch(e){}}
+      const fmt=n=>n.toLocaleString("en-US");
+      console.log("  вход "+fmt(ti)+"   выход "+fmt(to)+"   cache "+fmt(cc+cr));
+      console.log("  проект: "+path.basename(path.dirname(f)));
+    ' 2>/dev/null || echo "  (не удалось прочитать)"
+  fi
+}
+
+# Положить файл с хоста в контейнер под нужным владельцем и правами.
+put_file() { # CONTAINER SRC DEST OWNER MODE
+  local c=$1 src=$2 dest=$3 owner=$4 mode=$5
+  docker exec -u root "$c" bash -lc "mkdir -p '$(dirname "$dest")'" || return 1
+  docker cp "$src" "$c:$dest" || return 1
+  docker exec -u root "$c" bash -lc "chown $owner '$dest' && chmod $mode '$dest'"
+}
+
+seed_context() { # $1 = имя контейнера. Всё, что делает контейнер рабочим местом:
+                 # ssh-доступ наружу, токен Arcane, CLAUDE.md, ревьюер, скиллы.
+  local cname=$1
+
+  # ~/.ssh/config: алиас omv (деплой на сервер) + github.com. Ключ для GitHub нужен
+  # явной строкой — ssh пробует только стандартные имена (id_ed25519, id_rsa …),
+  # а id_github таким не является, и без записи git молча уходит в publickey denied.
+  docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.ssh && cat > /home/dev/.ssh/config <<'CFG'
+Host omv $HOST_IP
+  HostName $HOST_IP
+  User deployer
+  IdentityFile ~/.ssh/id_ed25519
+  StrictHostKeyChecking accept-new
+
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_github
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+CFG
+chmod 600 /home/dev/.ssh/config; chown dev:dev /home/dev/.ssh/config"
+
+  if [ -f "$GITHUBKEY" ]; then
+    put_file "$cname" "$GITHUBKEY" /home/dev/.ssh/id_github dev:dev 600 \
+      && echo "  ✓ ключ GitHub засеян (git clone/push работает)"
+  else
+    echo "  (нет $GITHUBKEY — git push/clone с GitHub работать не будет)"
+  fi
+
+  if [ -f "$ATOKEN_FILE" ]; then
+    put_file "$cname" "$ATOKEN_FILE" /home/dev/.arcane_token dev:dev 600 \
+      && echo "  ✓ токен Arcane засеян"
+  else
+    echo "  (нет $ATOKEN_FILE — обёртка arcane работать не будет; ключ создаётся в UI: Settings -> API keys)"
+  fi
+
+  if [ -f "$CLAUDEMD_TPL" ]; then
+    docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.claude"
+    sed "s/__CONTAINER__/$cname/g" "$CLAUDEMD_TPL" \
+      | docker exec -i -u root "$cname" bash -lc "cat > /home/dev/.claude/CLAUDE.md"
+    docker exec -u root "$cname" bash -lc "chown dev:dev /home/dev/.claude/CLAUDE.md && chmod 644 /home/dev/.claude/CLAUDE.md"
+    echo "  ✓ CLAUDE.md с описанием ландшафта засеян"
+  else
+    echo "  (нет $CLAUDEMD_TPL — Claude не получит контекст про test/prod)"
+  fi
+
+  seed_reviewer "$cname"
+
+  # скиллы Claude Code: кладём в ~/.claude/skills, откуда Claude их подхватывает сам
+  if [ -d "$SKILLS_DIR" ] && [ -n "$(ls -A "$SKILLS_DIR" 2>/dev/null)" ]; then
+    docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.claude/skills"
+    tar czf - -C "$SKILLS_DIR" . \
+      | docker exec -i -u root "$cname" bash -lc "tar xzf - -C /home/dev/.claude/skills"
+    docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.claude/skills"
+    echo "  ✓ скиллы засеяны: $(ls "$SKILLS_DIR" | tr '\n' ' ')"
+  fi
+}
+
+seed_reviewer() { # codex как внешний ревьюер ralphex: креды + настройки обоих
+  local cname=$1
+
+  if [ -f "$CODEX_AUTH_FILE" ]; then
+    put_file "$cname" "$CODEX_AUTH_FILE" /home/dev/.codex/auth.json dev:dev 600 \
+      && docker exec -u root "$cname" bash -lc "chown dev:dev /home/dev/.codex && chmod 700 /home/dev/.codex" \
+      && echo "  ✓ креды codex засеяны — ревью в ralphex заработает"
+  else
+    echo "  (нет $CODEX_AUTH_FILE — codex не авторизован, фаза ревью в ralphex не пройдёт)"
+    echo "   залогинься в любом контейнере: codex login  →  claude-dev-ctl save-codex-auth <контейнер>"
+  fi
+
+  if [ -f "$CODEX_TPL" ]; then
+    docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.codex"
+    sed "s/__CONTAINER__/$cname/g" "$CODEX_TPL" \
+      | docker exec -i -u root "$cname" bash -lc "cat > /home/dev/.codex/config.toml"
+    docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.codex && chmod 600 /home/dev/.codex/config.toml"
+    echo "  ✓ настройки codex засеяны"
+  fi
+
+  if [ -f "$RALPHEX_TPL" ]; then
+    docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.config/ralphex"
+    sed "s/__CONTAINER__/$cname/g" "$RALPHEX_TPL" \
+      | docker exec -i -u root "$cname" bash -lc "cat > /home/dev/.config/ralphex/config"
+    docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.config && chmod 644 /home/dev/.config/ralphex/config"
+    echo "  ✓ настройки ralphex засеяны (внешнее ревью через codex)"
+  fi
+}
+
+cmd_retrofit() { # применить токен/CLAUDE.md/ревьюера к уже существующему контейнеру
+  local cname=${1:?имя контейнера}
+  docker inspect "$cname" >/dev/null 2>&1 || { echo "Нет контейнера $cname"; exit 1; }
+  echo "Обновляю контекст в $cname:"
+  seed_context "$cname"
+}
+
+write_compose() { # $1 = имя проекта (без dev-), $2 = порт → печатает путь к compose-файлу
+  local name=$1 port=$2 cname="dev-$1" dir
+  dir="$(projects_dir)/$cname"
+  mkdir -p "$dir" || return 1
+  cat > "$dir/compose.yaml" <<YAML
+# Сгенерирован claude-dev-ctl. Правки руками переживут рестарт, но НЕ пересоздание
+# через \`claude-dev-ctl deploy\` — оно перезапишет файл.
+services:
+  $cname:
+    image: $IMAGE
+    container_name: $cname
+    hostname: $cname
+    labels:
+      claude.dev.managed: "true"
+      claude.dev.name: "$name"
+      claude.dev.port: "$port"
+    ports:
+      - "$port:22"
+    volumes:
+      - $name-code:/workspace
+      - $name-claude:/home/dev/.claude
+      - $name-codex:/home/dev/.codex
+      - $name-ssh:/home/dev/.ssh
+    restart: unless-stopped
+volumes:
+  $name-code:
+  $name-claude:
+  $name-codex:
+  $name-ssh:
+YAML
+  [ -f "$dir/.env" ] || : > "$dir/.env"   # Arcane ожидает .env рядом с compose
+  echo "$dir/compose.yaml"
+}
+
+cmd_deploy() {
+  local name=$1 port=$2 cname file
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "Имя: только строчные [a-z0-9-]"; exit 1; }
+  cname="dev-$name"
+  docker inspect "$cname" >/dev/null 2>&1 && { echo "Контейнер $cname уже существует"; exit 1; }
+  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
+    || { echo "Порт должен быть числом 1..65535"; exit 1; }
+  ss -ltn 2>/dev/null | grep -q ":$port " && { echo "Порт $port занят"; exit 1; }
+  [ -f "$MACKEY_FILE" ] || { echo "Нет $MACKEY_FILE (ключ Mac). Переустанови cdev."; exit 1; }
+  [ -f "$DEPLOYKEY" ]   || { echo "Нет deploy-ключа $DEPLOYKEY"; exit 1; }
+
+  file=$(write_compose "$name" "$port") || { echo "Не удалось записать compose-файл"; exit 1; }
+  docker compose -p "$cname" -f "$file" up -d || { echo "docker compose up не отработал"; exit 1; }
+
+  for _ in $(seq 1 20); do
+    [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = true ] && break; sleep 0.5
+  done
+
+  # посев ключей: вход с Mac + выход на хост (deployer)
+  docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.ssh"
+  docker exec -i -u root "$cname" bash -lc "cat > /home/dev/.ssh/authorized_keys" < "$MACKEY_FILE"
+  docker cp "$DEPLOYKEY" "$cname:/home/dev/.ssh/id_ed25519"
+  # ~/.ssh/config и ключ GitHub пишет seed_context ниже — так их чинит и retrofit
+  docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.ssh; chmod 700 /home/dev/.ssh; chmod 600 /home/dev/.ssh/authorized_keys /home/dev/.ssh/id_ed25519"
+
+  # пред-авторизация: подсунуть общие креды Claude, чтобы не логиниться заново
+  if [ -f "$CREDS_FILE" ]; then
+    put_file "$cname" "$CREDS_FILE" /home/dev/.claude/.credentials.json dev:dev 600 \
+      && echo "  ✓ креды Claude засеяны — контейнер уже авторизован"
+  else
+    echo "  (нет $CREDS_FILE — потребуется /login. Обнови: claude-dev-ctl save-creds <залогиненный-контейнер>)"
+  fi
+
+  # контекст ландшафта: токен Arcane, CLAUDE.md, ревьюер, скиллы
+  seed_context "$cname"
+
+  # Дождаться реальной готовности. Проверять проброшенный порт НЕЛЬЗЯ: docker-proxy
+  # принимает соединение на хосте ещё до того, как sshd внутри начал слушать, —
+  # тогда deploy рапортует "OK", а первое подключение получает Connection refused.
+  # Надёжный признак: entrypoint заканчивается `exec sshd`, поэтому PID 1 в контейнере
+  # становится sshd только после генерации host-ключей и всех chown'ов.
+  local ready=0
+  for _ in $(seq 1 60); do
+    if [ "$(docker exec "$cname" cat /proc/1/comm 2>/dev/null)" = "sshd" ]; then ready=1; break; fi
+    sleep 0.5
+  done
+
+  if [ "$ready" = 1 ]; then
+    echo "OK: $cname развёрнут на порту $port."
+    echo "Подключение: ssh -p $port dev@$HOST_IP   (внутри: claude)"
+  else
+    echo "ВНИМАНИЕ: $cname создан, но sshd не поднялся за 30 с."
+    echo "Проверь: docker logs $cname"
+  fi
+}
+
+cmd_rm() { # $1 = имя контейнера (dev-*), $2 = --purge?
+  local cname=$1 purge=${2:-} dir vols v
+  dir="$(projects_dir)/$cname"
+  vols=$(docker inspect -f '{{range .Mounts}}{{.Name}} {{end}}' "$cname" 2>/dev/null)
+
+  if [ -f "$dir/compose.yaml" ]; then
+    if [ "$purge" = "--purge" ]; then
+      docker compose -p "$cname" -f "$dir/compose.yaml" down -v
+    else
+      docker compose -p "$cname" -f "$dir/compose.yaml" down
+    fi
+    rm -rf "$dir"
+    echo "Проект $cname снят и удалён из каталога Arcane"
+  else
+    # контейнер создан не нами (или compose-файл потерян) — убираем руками
+    docker rm -f "$cname" >/dev/null 2>&1 && echo "Контейнер $cname удалён" \
+      || { echo "Не найдено: $cname"; exit 1; }
+    if [ "$purge" = "--purge" ]; then
+      for v in $vols; do docker volume rm "$v" >/dev/null 2>&1 && echo "  том $v удалён"; done
+    fi
+  fi
+
+  if [ "$purge" = "--purge" ]; then
+    echo "Тома удалены."
+  else
+    echo "Тома сохранены (код/логин/ключи)."
+  fi
+}
+
+cmd_save_creds() { # $1 = имя залогиненного контейнера → обновить мастер-креды Claude
+  local src=$1
+  docker cp "$src:/home/dev/.claude/.credentials.json" "$CREDS_FILE" 2>/dev/null \
+    && chmod 600 "$CREDS_FILE" \
+    && echo "Мастер-креды Claude обновлены из $src → $CREDS_FILE" \
+    || { echo "Не удалось прочитать креды из $src (залогинен ли он?)"; exit 1; }
+}
+
+cmd_save_codex_auth() { # $1 = контейнер, где выполнили `codex login`
+  local src=$1
+  docker cp "$src:/home/dev/.codex/auth.json" "$CODEX_AUTH_FILE" 2>/dev/null \
+    && chmod 600 "$CODEX_AUTH_FILE" \
+    && echo "Мастер-креды codex обновлены из $src → $CODEX_AUTH_FILE" \
+    && echo "Разложить по остальным: claude-dev-ctl retrofit <контейнер>" \
+    || { echo "Не удалось прочитать ~/.codex/auth.json из $src (выполнен ли codex login?)"; exit 1; }
+}
+
+case "${1:-}" in
+  list)            cmd_list ;;
+  port)            cmd_port "${2:?name}" ;;
+  inspect)         cmd_inspect "${2:?name}" "${3:-}" ;;
+  deploy)          cmd_deploy "${2:?name}" "${3:?port}" ;;
+  rm)              cmd_rm "${2:?name}" "${3:-}" ;;
+  save-creds)      cmd_save_creds "${2:?container}" ;;
+  save-codex-auth) cmd_save_codex_auth "${2:?container}" ;;
+  retrofit)        cmd_retrofit "${2:?container}" ;;
+  *) echo "usage: claude-dev-ctl {list|port <c>|inspect <c> [--tokens]|deploy <name> <port>|rm <c> [--purge]|save-creds <c>|save-codex-auth <c>|retrofit <c>}"; exit 1 ;;
+esac

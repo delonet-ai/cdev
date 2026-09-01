@@ -1,0 +1,32 @@
+# Стек одного dev-контейнера (projectA) — шаблон «на руках».
+# Обычно контейнеры создаёт `claude-dev-ctl deploy`, который генерирует такой же
+# файл в каталоге проектов Arcane. Этот образец нужен для первого контейнера
+# (когда claude-dev-ctl ещё не установлен) и как справка о составе томов.
+#
+# В Arcane: Projects -> Create, вставить содержимое.
+# Образ omv/claude-dev:latest должен быть собран заранее (см. README, шаг 1).
+
+services:
+  dev-projectA:
+    image: omv/claude-dev:latest
+    container_name: dev-projectA
+    hostname: dev-projectA
+    labels:
+      claude.dev.managed: "true"       # по этой метке контейнер видит cdev
+      claude.dev.name: "projectA"
+      claude.dev.port: "2201"
+    ports:
+      - "2201:22"          # projectB -> "2202:22", projectC -> "2203:22" ...
+    volumes:
+      - projectA-code:/workspace           # код проекта (git-клоны), изолирован
+      - projectA-claude:/home/dev/.claude  # авторизация Claude Max/Pro + настройки
+      - projectA-codex:/home/dev/.codex    # авторизация codex (ревьюер в ralphex)
+      - projectA-ssh:/home/dev/.ssh        # ключи: вход с Mac + выход на OMV-хост
+    restart: unless-stopped
+    # Тома prod/test СЮДА НЕ монтируем — файловая изоляция.
+
+volumes:
+  projectA-code:
+  projectA-claude:
+  projectA-codex:
+  projectA-ssh:
