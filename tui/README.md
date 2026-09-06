@@ -36,11 +36,13 @@ cdev
 | Файл | Где | Назначение |
 |---|---|---|
 | `cdev` | Mac (`/opt/homebrew/bin/cdev` → сюда) | fzf-обёртка |
-| `claude-dev-ctl` | OMV (`/usr/local/bin/`) | list / inspect / port / deploy / rm / retrofit / save-*-creds |
+| `claude-dev-ctl` | OMV (`/usr/local/bin/`) | list / doctor / inspect / port / deploy / rm / retrofit / save-*-creds |
 
 `claude-dev-ctl` напрямую:
 ```bash
 ssh omv claude-dev-ctl list
+ssh omv claude-dev-ctl doctor                       # всё ли на месте: хост + все контейнеры
+ssh omv claude-dev-ctl doctor dev-projectA          # только один контейнер
 ssh omv claude-dev-ctl inspect dev-projectA --tokens
 ssh omv claude-dev-ctl deploy myproj 2202
 ssh omv claude-dev-ctl rm dev-myproj [--purge]
