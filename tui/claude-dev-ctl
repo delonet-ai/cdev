@@ -198,6 +198,7 @@ chmod 600 /home/dev/.ssh/config; chown dev:dev /home/dev/.ssh/config"
     echo "  (нет $CLAUDEMD_TPL — Claude не получит контекст про test/prod)"
   fi
 
+  seed_login "$cname"
   seed_reviewer "$cname"
 
   # скиллы Claude Code: кладём в ~/.claude/skills, откуда Claude их подхватывает сам
@@ -218,31 +219,44 @@ seed_config() { # CONTAINER TEMPLATE DEST MODE LABEL
   local c=$1 tpl=$2 dest=$3 mode=$4 label=$5
   [ -f "$tpl" ] || return 0
   if [ "$FORCE_SEED" != 1 ] && docker exec -u dev "$c" test -e "$dest" 2>/dev/null; then
-    echo "  · $label уже есть — не трогаю (перезаписать: retrofit --force)"
+    echo "  · уже есть: $label — не трогаю (перезаписать: retrofit --force)"
     return 0
   fi
   docker exec -u root "$c" bash -lc "mkdir -p '$(dirname "$dest")'"
   sed "s/__CONTAINER__/$c/g" "$tpl" \
     | docker exec -i -u root "$c" bash -lc "cat > '$dest'"
   docker exec -u root "$c" bash -lc "chown dev:dev '$dest' && chmod $mode '$dest'"
-  echo "  ✓ $label засеян"
+  echo "  ✓ засеяно: $label"
+}
+
+# Пред-авторизация: положить мастер-креды с хоста, чтобы контейнер стартовал
+# залогиненным. Не перезаписываем существующие по той же причине, что и у codex:
+# логин в контейнере обновляется сам, и мастер на хосте бывает старее.
+seed_creds() { # CONTAINER MASTER DEST LABEL HINT
+  local c=$1 master=$2 dest=$3 label=$4 hint=$5
+  if [ ! -f "$master" ]; then
+    echo "  (нет $master — $hint)"
+    return 0
+  fi
+  if [ "$FORCE_SEED" != 1 ] && docker exec -u dev "$c" test -s "$dest" 2>/dev/null; then
+    echo "  · уже есть: $label — не трогаю (перезаписать: retrofit --force)"
+    return 0
+  fi
+  put_file "$c" "$master" "$dest" dev:dev 600 \
+    && echo "  ✓ засеяно: $label — контейнер уже авторизован"
+}
+
+seed_login() { # авторизация Claude Code
+  seed_creds "$1" "$CREDS_FILE" /home/dev/.claude/.credentials.json "логин Claude" \
+    "потребуется /login; обнови мастер: claude-dev-ctl save-creds <залогиненный-контейнер>"
 }
 
 seed_reviewer() { # codex как внешний ревьюер ralphex: креды + настройки обоих
   local cname=$1
 
-  if [ ! -f "$CODEX_AUTH_FILE" ]; then
-    echo "  (нет $CODEX_AUTH_FILE — codex не авторизован, фаза ревью в ralphex не пройдёт)"
-    echo "   залогинься в любом контейнере: codex login  →  claude-dev-ctl save-codex-auth <контейнер>"
-  elif [ "$FORCE_SEED" != 1 ] && docker exec -u dev "$cname" test -s /home/dev/.codex/auth.json 2>/dev/null; then
-    # токен в контейнере обновляется сам; мастер на хосте может быть старее, и
-    # затереть свежий протухшим — верный способ сломать ночной прогон
-    echo "  · codex уже авторизован — креды не трогаю (перезаписать: retrofit --force)"
-  else
-    put_file "$cname" "$CODEX_AUTH_FILE" /home/dev/.codex/auth.json dev:dev 600 \
-      && docker exec -u root "$cname" bash -lc "chown dev:dev /home/dev/.codex && chmod 700 /home/dev/.codex" \
-      && echo "  ✓ креды codex засеяны — ревью в ralphex заработает"
-  fi
+  seed_creds "$cname" "$CODEX_AUTH_FILE" /home/dev/.codex/auth.json "логин codex" \
+    "codex не авторизован, фаза ревью в ralphex не пройдёт; сделай codex login в любом контейнере и claude-dev-ctl save-codex-auth <контейнер>"
+  docker exec -u root "$cname" bash -lc "chown dev:dev /home/dev/.codex 2>/dev/null && chmod 700 /home/dev/.codex 2>/dev/null" || true
 
   seed_config "$cname" "$CODEX_TPL"   /home/dev/.codex/config.toml        600 "настройки codex"
   seed_config "$cname" "$RALPHEX_TPL" /home/dev/.config/ralphex/config    644 "настройки ralphex"
@@ -303,7 +317,12 @@ cmd_deploy() {
   [ -f "$DEPLOYKEY" ]   || { echo "Нет deploy-ключа $DEPLOYKEY"; exit 1; }
 
   file=$(write_compose "$name" "$port") || { echo "Не удалось записать compose-файл"; exit 1; }
-  docker compose -p "$cname" -f "$file" up -d || { echo "docker compose up не отработал"; exit 1; }
+  # Тома, созданные не compose'ом (например, ещё Portainer'ом), отличаются меткой
+  # config-hash — и compose спрашивает «пересоздать? данные будут потеряны». В томе
+  # лежит код проекта, поэтому единственный приемлемый ответ — «нет», и получать его
+  # нужно не от того, кто быстрее нажмёт y: закрытый stdin даёт именно его.
+  docker compose -p "$cname" -f "$file" up -d < /dev/null \
+    || { echo "docker compose up не отработал"; exit 1; }
 
   for _ in $(seq 1 20); do
     [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = true ] && break; sleep 0.5
@@ -316,15 +335,9 @@ cmd_deploy() {
   # ~/.ssh/config и ключ GitHub пишет seed_context ниже — так их чинит и retrofit
   docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.ssh; chmod 700 /home/dev/.ssh; chmod 600 /home/dev/.ssh/authorized_keys /home/dev/.ssh/id_ed25519"
 
-  # пред-авторизация: подсунуть общие креды Claude, чтобы не логиниться заново
-  if [ -f "$CREDS_FILE" ]; then
-    put_file "$cname" "$CREDS_FILE" /home/dev/.claude/.credentials.json dev:dev 600 \
-      && echo "  ✓ креды Claude засеяны — контейнер уже авторизован"
-  else
-    echo "  (нет $CREDS_FILE — потребуется /login. Обнови: claude-dev-ctl save-creds <залогиненный-контейнер>)"
-  fi
-
-  # контекст ландшафта: токен Arcane, CLAUDE.md, ревьюер, скиллы
+  # контекст ландшафта: токен Arcane, CLAUDE.md, пред-авторизация Claude и codex, скиллы.
+  # Логины засевает seed_context, а не deploy: тогда retrofit --force чинит и их,
+  # а не только настройки — иначе протухший логин лечился бы лишь пересозданием.
   seed_context "$cname"
 
   # Дождаться реальной готовности. Проверять проброшенный порт НЕЛЬЗЯ: docker-proxy

@@ -185,9 +185,45 @@ ssh omv claude-dev-ctl retrofit dev-myproj --force   # ещё и настрой�
 получит их после пересоздания (`rm` без `--purge` + `deploy` — тома с кодом, логином и
 авторизацией codex переживут).
 
-> ⚠️ Контейнеры, созданные до этого кита, держат `~/.codex` и `~/.config/ralphex` **не в
-> томе** — при пересоздании они потеряются. Сначала сними с них авторизацию
-> (`save-codex-auth`) и скопируй настройки, потом пересоздавай.
+---
+
+## Пересоздание контейнера
+
+Через UI Arcane пересобрать контейнер **нельзя, пока он не стал проектом Arcane**.
+Контейнеры, оставшиеся от Portainer, — сироты: их compose-файл жил в томе Portainer и
+исчез вместе с ним, так что ни Arcane, ни `docker compose` про них ничего не знают.
+Первое пересоздание делает `claude-dev-ctl`, дальше проект появляется в Arcane и
+кнопки в UI (и `arcane redeploy`) начинают работать.
+
+```bash
+# 1. Снять то, что живёт вне томов и потеряется. Для контейнеров, созданных до этого
+#    кита, это ~/.codex целиком (авторизация ревьюера) и ~/.config/ralphex.
+ssh omv claude-dev-ctl save-codex-auth dev-myproj
+ssh omv 'docker cp dev-myproj:/home/dev/.codex/config.toml /root/claude-dev-build/backup-dev-myproj-codex.toml'
+ssh omv 'docker cp dev-myproj:/home/dev/.config/ralphex /root/claude-dev-build/backup-dev-myproj-ralphex'
+
+# 2. Снести контейнер БЕЗ --purge: тома с кодом, логином Claude и ключами остаются.
+ssh omv claude-dev-ctl rm dev-myproj
+
+# 3. Поднять заново — тот же порт, то же имя. Тома переиспользуются по именам,
+#    всё остальное засевается заново из /root/claude-dev-build.
+ssh omv claude-dev-ctl deploy myproj 2222
+```
+
+На шаге 3 compose напишет `Volume "…" exists but doesn't match configuration in compose
+file. Recreate (data will be lost)?` — это про метку `config-hash`, которую проставил
+Portainer. `claude-dev-ctl` отвечает «нет» за тебя (закрытый stdin), данные остаются на
+месте. Если запускаешь `docker compose` руками — не ответь на этот вопрос «y».
+
+Дальше проект `dev-myproj` виден в Arcane, и обычный цикл — уже через него:
+
+```bash
+arcane projects              # из dev-контейнера
+arcane redeploy dev-myproj   # или кнопка Redeploy в UI
+```
+
+> Новый образ подхватывается именно на этом шаге: `docker compose up` берёт
+> `omv/claude-dev:latest`, поэтому сначала пересобери образ, потом пересоздавай.
 
 ---
 
