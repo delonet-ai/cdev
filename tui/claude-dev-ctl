@@ -22,6 +22,7 @@ CLAUDEMD_TPL=$BUILD_DIR/CLAUDE.md.template             # контекст лан
 CODEX_TPL=$BUILD_DIR/codex-config.toml.template        # настройки codex как ревьюера
 RALPHEX_TPL=$BUILD_DIR/ralphex-config.template         # настройки автономного цикла
 SKILLS_DIR=$BUILD_DIR/skills                           # скиллы Claude Code для контейнеров
+STATE_DIR=$BUILD_DIR/state                             # снимки файлов из $HOME, не покрытых томами
 
 FORCE_SEED=0   # 1 = перезаписывать пользовательские настройки (retrofit --force)
 
@@ -293,12 +294,14 @@ services:
       - $name-code:/workspace
       - $name-claude:/home/dev/.claude
       - $name-codex:/home/dev/.codex
+      - $name-config:/home/dev/.config
       - $name-ssh:/home/dev/.ssh
     restart: unless-stopped
 volumes:
   $name-code:
   $name-claude:
   $name-codex:
+  $name-config:
   $name-ssh:
 YAML
   [ -f "$dir/.env" ] || : > "$dir/.env"   # Arcane ожидает .env рядом с compose
@@ -335,6 +338,13 @@ cmd_deploy() {
   # ~/.ssh/config и ключ GitHub пишет seed_context ниже — так их чинит и retrofit
   docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.ssh; chmod 700 /home/dev/.ssh; chmod 600 /home/dev/.ssh/authorized_keys /home/dev/.ssh/id_ed25519"
 
+  # ~/.claude.json лежит в $HOME, а не в томе ~/.claude, и потому пересоздание его
+  # теряет — вместе с отметкой «этому каталогу доверяю». Снимок делает cmd_rm.
+  if [ -f "$STATE_DIR/$cname.claude.json" ]; then
+    put_file "$cname" "$STATE_DIR/$cname.claude.json" /home/dev/.claude.json dev:dev 600 \
+      && echo "  ✓ восстановлен ~/.claude.json (доверенные каталоги, настройки)"
+  fi
+
   # контекст ландшафта: токен Arcane, CLAUDE.md, пред-авторизация Claude и codex, скиллы.
   # Логины засевает seed_context, а не deploy: тогда retrofit --force чинит и их,
   # а не только настройки — иначе протухший логин лечился бы лишь пересозданием.
@@ -364,6 +374,19 @@ cmd_rm() { # $1 = имя контейнера (dev-*), $2 = --purge?
   local cname=$1 purge=${2:-} dir vols v
   dir="$(projects_dir)/$cname"
   vols=$(docker inspect -f '{{range .Mounts}}{{.Name}} {{end}}' "$cname" 2>/dev/null)
+
+  # ~/.claude.json живёт в $HOME, куда не смонтирован ни один том, — то есть
+  # переживает рестарт, но не пересоздание. В нём отметка «этому каталогу доверяю»,
+  # без которой Claude при первом запуске снова спросит про папку. Снимок кладём
+  # рядом с прочим состоянием кита; при --purge он тоже уходит.
+  if [ "$purge" = "--purge" ]; then
+    rm -f "$STATE_DIR/$cname.claude.json"
+  else
+    mkdir -p "$STATE_DIR"
+    docker cp "$cname:/home/dev/.claude.json" "$STATE_DIR/$cname.claude.json" 2>/dev/null \
+      && chmod 600 "$STATE_DIR/$cname.claude.json" \
+      && echo "Снимок ~/.claude.json сохранён — восстановится при следующем deploy"
+  fi
 
   if [ -f "$dir/compose.yaml" ]; then
     if [ "$purge" = "--purge" ]; then

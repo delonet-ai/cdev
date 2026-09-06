@@ -21,6 +21,7 @@ services:
       - projectA-code:/workspace           # код проекта (git-клоны), изолирован
       - projectA-claude:/home/dev/.claude  # авторизация Claude Max/Pro + настройки
       - projectA-codex:/home/dev/.codex    # авторизация codex (ревьюер в ralphex)
+      - projectA-config:/home/dev/.config  # настройки ralphex, авторизация gh
       - projectA-ssh:/home/dev/.ssh        # ключи: вход с Mac + выход на OMV-хост
     restart: unless-stopped
     # Тома prod/test СЮДА НЕ монтируем — файловая изоляция.
@@ -29,4 +30,5 @@ volumes:
   projectA-code:
   projectA-claude:
   projectA-codex:
+  projectA-config:
   projectA-ssh:

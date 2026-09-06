@@ -44,6 +44,16 @@ if [ "$(stat -c %U "$CODEX_DIR")" != "dev" ]; then
 fi
 chmod 700 "$CODEX_DIR"
 
+# ~/.config — тоже том: здесь живут настройки ralphex (его конфиг, agents/, prompts/)
+# и авторизация gh. Без тома всё это лежало в слое контейнера и умирало при
+# пересоздании — вместе с любыми правками, которые пользователь туда внёс.
+CONFIG_DIR=/home/dev/.config
+mkdir -p "$CONFIG_DIR"
+if [ "$(stat -c %U "$CONFIG_DIR")" != "dev" ]; then
+  chown -R dev:dev "$CONFIG_DIR"
+fi
+chmod 700 "$CONFIG_DIR"
+
 # /workspace тоже приходит томом от root — без этого dev не может ни склонировать
 # репозиторий, ни принять файлы по scp/rsync. Меняем владельца только у самой
 # папки (без -R): на свежем томе она пуста, а на большом репозитории -R был бы дорог.

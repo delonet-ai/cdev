@@ -196,24 +196,30 @@ ssh omv claude-dev-ctl retrofit dev-myproj --force   # ещё и настрой�
 кнопки в UI (и `arcane redeploy`) начинают работать.
 
 ```bash
-# 1. Снять то, что живёт вне томов и потеряется. Для контейнеров, созданных до этого
-#    кита, это ~/.codex целиком (авторизация ревьюера) и ~/.config/ralphex.
-ssh omv claude-dev-ctl save-codex-auth dev-myproj
-ssh omv 'docker cp dev-myproj:/home/dev/.codex/config.toml /root/claude-dev-build/backup-dev-myproj-codex.toml'
-ssh omv 'docker cp dev-myproj:/home/dev/.config/ralphex /root/claude-dev-build/backup-dev-myproj-ralphex'
-
-# 2. Снести контейнер БЕЗ --purge: тома с кодом, логином Claude и ключами остаются.
-ssh omv claude-dev-ctl rm dev-myproj
-
-# 3. Поднять заново — тот же порт, то же имя. Тома переиспользуются по именам,
-#    всё остальное засевается заново из /root/claude-dev-build.
-ssh omv claude-dev-ctl deploy myproj 2222
+ssh omv 'claude-dev-ctl rm dev-myproj && claude-dev-ctl deploy myproj 2222'
 ```
 
-На шаге 3 compose напишет `Volume "…" exists but doesn't match configuration in compose
-file. Recreate (data will be lost)?` — это про метку `config-hash`, которую проставил
-Portainer. `claude-dev-ctl` отвечает «нет» за тебя (закрытый stdin), данные остаются на
-месте. Если запускаешь `docker compose` руками — не ответь на этот вопрос «y».
+`rm` без `--purge` тома не трогает, `deploy` переиспользует их по именам
+(`dev-myproj_myproj-code` и далее): код, логин Claude, авторизация codex, настройки
+ralphex и ключи на месте. Перед удалением `rm` снимает ещё и `~/.claude.json` в
+`/root/claude-dev-build/state/` — этот файл лежит в `$HOME`, куда не смонтирован ни один
+том, а в нём отметка «этому каталогу доверяю»; `deploy` кладёт его обратно, иначе Claude
+при первом запуске снова спросит про папку.
+
+> **Контейнеры, созданные до этого кита**, держат `~/.codex` и `~/.config` в слое
+> контейнера, а не в томе, — там авторизация codex и настройки ralphex, и они пропадут.
+> Сначала сними их:
+>
+> ```bash
+> ssh omv claude-dev-ctl save-codex-auth dev-myproj
+> ssh omv 'docker cp dev-myproj:/home/dev/.config /root/claude-dev-build/backup-dev-myproj-config'
+> ```
+
+При первом пересоздании compose может написать `Volume "…" exists but doesn't match
+configuration in compose file. Recreate (data will be lost)?` — это про метку
+`config-hash`, которую проставил прежний менеджер стеков. `claude-dev-ctl` отвечает
+«нет» за тебя (закрытый stdin), данные остаются на месте. Если запускаешь `docker
+compose` руками — не ответь на этот вопрос «y».
 
 Дальше проект `dev-myproj` виден в Arcane, и обычный цикл — уже через него:
 
