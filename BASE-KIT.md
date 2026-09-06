@@ -72,11 +72,18 @@ Claude Code, а результат перечитывает другая мод�
 | `~/.ssh/config` | алиасы `omv`, IP хоста, `github.com` | генерируется |
 | креды Claude | `~/.claude/.credentials.json` | `claude-credentials.json` |
 | токен Arcane | `~/.arcane_token` | `arcane_container_token` |
-| креды codex | `~/.codex/auth.json` | `codex-auth.json` |
-| настройки codex | `~/.codex/config.toml` | `codex-config.toml.template` |
-| настройки ralphex | `~/.config/ralphex/config` | `ralphex-config.template` |
+| креды codex | `~/.codex/auth.json` | `codex-auth.json` (один раз) |
+| настройки codex | `~/.codex/config.toml` | `codex-config.toml.template` (один раз) |
+| настройки ralphex | `~/.config/ralphex/config` | `ralphex-config.template` (один раз) |
 | правила для Claude | `~/.claude/CLAUDE.md` | `CLAUDE.md.template` |
 | скиллы Claude Code | `~/.claude/skills/` | `skills/` |
+
+Помеченное «один раз» засевается только при создании контейнера. В настройках codex и
+ralphex живут решения пользователя — доверенные каталоги, выбранная песочница, — и
+`retrofit` их намеренно не трогает: молча стереть их значит сломать рабочий контейнер.
+Креды codex не перезаписываются по другой причине: токен в контейнере обновляется сам и
+бывает свежее мастера на хосте. Перезаписать всё это осознанно:
+`claude-dev-ctl retrofit dev-<имя> --force`.
 
 Запись `Host omv 192.168.0.100` в ssh-config совпадает и с алиасом, и с IP: docker CLI
 ходит по IP, а не по алиасу, и без этого падал с `Host key verification failed`.

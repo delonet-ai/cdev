@@ -23,6 +23,8 @@ CODEX_TPL=$BUILD_DIR/codex-config.toml.template        # настройки code
 RALPHEX_TPL=$BUILD_DIR/ralphex-config.template         # настройки автономного цикла
 SKILLS_DIR=$BUILD_DIR/skills                           # скиллы Claude Code для контейнеров
 
+FORCE_SEED=0   # 1 = перезаписывать пользовательские настройки (retrofit --force)
+
 # Каталог проектов Arcane. Лежит в его томе с данными; спрашиваем docker, а не
 # зашиваем путь: у другой установки том называется иначе или смонтирован с хоста.
 projects_dir() {
@@ -208,37 +210,48 @@ chmod 600 /home/dev/.ssh/config; chown dev:dev /home/dev/.ssh/config"
   fi
 }
 
+# Засеять файл настроек, НЕ трогая то, что уже настроено в контейнере.
+# Разница с CLAUDE.md принципиальная: правила кита мы навязываем и перезаписываем,
+# а в этих файлах живут пользовательские решения — доверенные проекты codex,
+# выбранная песочница — и молча стереть их значит сломать рабочий контейнер.
+seed_config() { # CONTAINER TEMPLATE DEST MODE LABEL
+  local c=$1 tpl=$2 dest=$3 mode=$4 label=$5
+  [ -f "$tpl" ] || return 0
+  if [ "$FORCE_SEED" != 1 ] && docker exec -u dev "$c" test -e "$dest" 2>/dev/null; then
+    echo "  · $label уже есть — не трогаю (перезаписать: retrofit --force)"
+    return 0
+  fi
+  docker exec -u root "$c" bash -lc "mkdir -p '$(dirname "$dest")'"
+  sed "s/__CONTAINER__/$c/g" "$tpl" \
+    | docker exec -i -u root "$c" bash -lc "cat > '$dest'"
+  docker exec -u root "$c" bash -lc "chown dev:dev '$dest' && chmod $mode '$dest'"
+  echo "  ✓ $label засеян"
+}
+
 seed_reviewer() { # codex как внешний ревьюер ralphex: креды + настройки обоих
   local cname=$1
 
-  if [ -f "$CODEX_AUTH_FILE" ]; then
+  if [ ! -f "$CODEX_AUTH_FILE" ]; then
+    echo "  (нет $CODEX_AUTH_FILE — codex не авторизован, фаза ревью в ralphex не пройдёт)"
+    echo "   залогинься в любом контейнере: codex login  →  claude-dev-ctl save-codex-auth <контейнер>"
+  elif [ "$FORCE_SEED" != 1 ] && docker exec -u dev "$cname" test -s /home/dev/.codex/auth.json 2>/dev/null; then
+    # токен в контейнере обновляется сам; мастер на хосте может быть старее, и
+    # затереть свежий протухшим — верный способ сломать ночной прогон
+    echo "  · codex уже авторизован — креды не трогаю (перезаписать: retrofit --force)"
+  else
     put_file "$cname" "$CODEX_AUTH_FILE" /home/dev/.codex/auth.json dev:dev 600 \
       && docker exec -u root "$cname" bash -lc "chown dev:dev /home/dev/.codex && chmod 700 /home/dev/.codex" \
       && echo "  ✓ креды codex засеяны — ревью в ralphex заработает"
-  else
-    echo "  (нет $CODEX_AUTH_FILE — codex не авторизован, фаза ревью в ralphex не пройдёт)"
-    echo "   залогинься в любом контейнере: codex login  →  claude-dev-ctl save-codex-auth <контейнер>"
   fi
 
-  if [ -f "$CODEX_TPL" ]; then
-    docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.codex"
-    sed "s/__CONTAINER__/$cname/g" "$CODEX_TPL" \
-      | docker exec -i -u root "$cname" bash -lc "cat > /home/dev/.codex/config.toml"
-    docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.codex && chmod 600 /home/dev/.codex/config.toml"
-    echo "  ✓ настройки codex засеяны"
-  fi
-
-  if [ -f "$RALPHEX_TPL" ]; then
-    docker exec -u root "$cname" bash -lc "mkdir -p /home/dev/.config/ralphex"
-    sed "s/__CONTAINER__/$cname/g" "$RALPHEX_TPL" \
-      | docker exec -i -u root "$cname" bash -lc "cat > /home/dev/.config/ralphex/config"
-    docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.config && chmod 644 /home/dev/.config/ralphex/config"
-    echo "  ✓ настройки ralphex засеяны (внешнее ревью через codex)"
-  fi
+  seed_config "$cname" "$CODEX_TPL"   /home/dev/.codex/config.toml        600 "настройки codex"
+  seed_config "$cname" "$RALPHEX_TPL" /home/dev/.config/ralphex/config    644 "настройки ralphex"
+  docker exec -u root "$cname" bash -lc "chown -R dev:dev /home/dev/.config 2>/dev/null" || true
 }
 
 cmd_retrofit() { # применить токен/CLAUDE.md/ревьюера к уже существующему контейнеру
   local cname=${1:?имя контейнера}
+  [ "${2:-}" = "--force" ] && FORCE_SEED=1
   docker inspect "$cname" >/dev/null 2>&1 || { echo "Нет контейнера $cname"; exit 1; }
   echo "Обновляю контекст в $cname:"
   seed_context "$cname"
@@ -388,6 +401,6 @@ case "${1:-}" in
   rm)              cmd_rm "${2:?name}" "${3:-}" ;;
   save-creds)      cmd_save_creds "${2:?container}" ;;
   save-codex-auth) cmd_save_codex_auth "${2:?container}" ;;
-  retrofit)        cmd_retrofit "${2:?container}" ;;
-  *) echo "usage: claude-dev-ctl {list|port <c>|inspect <c> [--tokens]|deploy <name> <port>|rm <c> [--purge]|save-creds <c>|save-codex-auth <c>|retrofit <c>}"; exit 1 ;;
+  retrofit)        cmd_retrofit "${2:?container}" "${3:-}" ;;
+  *) echo "usage: claude-dev-ctl {list|port <c>|inspect <c> [--tokens]|deploy <name> <port>|rm <c> [--purge]|save-creds <c>|save-codex-auth <c>|retrofit <c> [--force]}"; exit 1 ;;
 esac

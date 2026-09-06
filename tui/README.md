@@ -44,7 +44,8 @@ ssh omv claude-dev-ctl list
 ssh omv claude-dev-ctl inspect dev-projectA --tokens
 ssh omv claude-dev-ctl deploy myproj 2202
 ssh omv claude-dev-ctl rm dev-myproj [--purge]
-ssh omv claude-dev-ctl retrofit dev-projectA        # обновить правила/креды/настройки
+ssh omv claude-dev-ctl retrofit dev-projectA        # обновить правила, ключи, токены
+ssh omv claude-dev-ctl retrofit dev-projectA --force # ещё и настройки/креды codex и ralphex
 ssh omv claude-dev-ctl save-creds dev-projectA      # мастер-креды Claude с этого контейнера
 ssh omv claude-dev-ctl save-codex-auth dev-projectA # мастер-креды codex (после codex login)
 ```
