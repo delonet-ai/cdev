@@ -16,6 +16,7 @@ MACKEY_FILE=$BUILD_DIR/mac_authorized_key
 DEPLOYKEY=$BUILD_DIR/keys/id_dev_to_omv
 GITHUBKEY=$BUILD_DIR/keys/id_github                    # общий ключ для git clone/push
 CREDS_FILE=$BUILD_DIR/claude-credentials.json          # мастер-креды Claude (только на хосте, не в git!)
+ACCOUNT_FILE=$BUILD_DIR/claude-account.json            # опознание аккаунта для ~/.claude.json
 CODEX_AUTH_FILE=$BUILD_DIR/codex-auth.json             # мастер-креды codex (~/.codex/auth.json)
 ATOKEN_FILE=$BUILD_DIR/arcane_container_token          # общий Arcane-токен для dev-контейнеров
 CLAUDEMD_TPL=$BUILD_DIR/CLAUDE.md.template             # контекст ландшафта для Claude
@@ -25,6 +26,40 @@ SKILLS_DIR=$BUILD_DIR/skills                           # скиллы Claude Cod
 STATE_DIR=$BUILD_DIR/state                             # снимки файлов из $HOME, не покрытых томами
 
 FORCE_SEED=0   # 1 = перезаписывать пользовательские настройки (retrofit --force)
+
+# Логин Claude — это ДВА файла, и одного мало. Токен лежит в ~/.claude/.credentials.json
+# (том, переживает пересоздание), а в ~/.claude.json — опознание аккаунта: oauthAccount,
+# userID, отметка о пройденном онбординге. Файл этот в корне $HOME, томом не покрыт, и
+# без него Claude запускает вход заново, хотя валидный токен лежит рядом. Поэтому
+# опознание держим отдельным мастер-файлом и подмешиваем в каждый контейнер.
+ACCOUNT_KEYS='["oauthAccount","userID","hasCompletedOnboarding","lastOnboardingVersion"]'
+
+# Вытащить опознание из залогиненного контейнера (в stdout).
+ACCOUNT_EXTRACT_JS='
+const fs = require("fs"), os = require("os");
+let j;
+try { j = JSON.parse(fs.readFileSync(os.homedir() + "/.claude.json", "utf8")); }
+catch (e) { console.error("нет ~/.claude.json: " + e.message); process.exit(1); }
+const keep = JSON.parse(process.argv[1]);
+const out = {};
+for (const k of keep) if (j[k] !== undefined) out[k] = j[k];
+if (!out.oauthAccount) { console.error("в ~/.claude.json нет oauthAccount — контейнер не залогинен"); process.exit(1); }
+process.stdout.write(JSON.stringify(out, null, 2));
+'
+
+# Подмешать опознание в ~/.claude.json контейнера, сохранив всё остальное (machineID,
+# доверенные каталоги, счётчики) — их перезаписывать нельзя, они про эту машину.
+ACCOUNT_MERGE_JS='
+const fs = require("fs"), os = require("os"), p = os.homedir() + "/.claude.json";
+let inp = "";
+process.stdin.on("data", d => inp += d).on("end", () => {
+  const add = JSON.parse(inp);
+  let cur = {};
+  try { cur = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) {}
+  Object.assign(cur, add);
+  fs.writeFileSync(p, JSON.stringify(cur, null, 2), { mode: 0o600 });
+});
+'
 
 # Каталог проектов Arcane. Лежит в его томе с данными; спрашиваем docker, а не
 # зашиваем путь: у другой установки том называется иначе или смонтирован с хоста.
@@ -247,9 +282,23 @@ seed_creds() { # CONTAINER MASTER DEST LABEL HINT
     && echo "  ✓ засеяно: $label — контейнер уже авторизован"
 }
 
-seed_login() { # авторизация Claude Code
-  seed_creds "$1" "$CREDS_FILE" /home/dev/.claude/.credentials.json "логин Claude" \
+seed_login() { # авторизация Claude Code: токен + опознание аккаунта
+  local c=$1
+  seed_creds "$c" "$CREDS_FILE" /home/dev/.claude/.credentials.json "логин Claude" \
     "потребуется /login; обнови мастер: claude-dev-ctl save-creds <залогиненный-контейнер>"
+
+  if [ ! -f "$ACCOUNT_FILE" ]; then
+    echo "  (нет $ACCOUNT_FILE — Claude попросит войти, даже имея валидный токен;"
+    echo "   снимается тем же claude-dev-ctl save-creds <залогиненный-контейнер>)"
+    return 0
+  fi
+  # Опознание подмешиваем всегда: в отличие от токена оно не протухает и не
+  # перезаписывает ничего своего — merge трогает только четыре ключа про аккаунт.
+  if docker exec -i -u dev "$c" node -e "$ACCOUNT_MERGE_JS" < "$ACCOUNT_FILE" 2>/dev/null; then
+    echo "  ✓ засеяно: опознание аккаунта (без него вход просят заново)"
+  else
+    echo "  ✗ не удалось записать опознание в ~/.claude.json"
+  fi
 }
 
 seed_reviewer() { # codex как внешний ревьюер ralphex: креды + настройки обоих
@@ -412,12 +461,25 @@ cmd_rm() { # $1 = имя контейнера (dev-*), $2 = --purge?
   fi
 }
 
-cmd_save_creds() { # $1 = имя залогиненного контейнера → обновить мастер-креды Claude
+cmd_save_creds() { # $1 = имя залогиненного контейнера → обновить мастер-логин Claude
   local src=$1
   docker cp "$src:/home/dev/.claude/.credentials.json" "$CREDS_FILE" 2>/dev/null \
     && chmod 600 "$CREDS_FILE" \
-    && echo "Мастер-креды Claude обновлены из $src → $CREDS_FILE" \
+    && echo "Мастер-токен Claude обновлён из $src → $CREDS_FILE" \
     || { echo "Не удалось прочитать креды из $src (залогинен ли он?)"; exit 1; }
+
+  # Второй половиной логина занимаемся здесь же: снимать её отдельной командой значит
+  # однажды забыть — и получить контейнер, который просит войти с валидным токеном.
+  if docker exec -u dev "$src" node -e "$ACCOUNT_EXTRACT_JS" "$ACCOUNT_KEYS" > "$ACCOUNT_FILE.tmp" 2>/dev/null \
+     && [ -s "$ACCOUNT_FILE.tmp" ]; then
+    mv "$ACCOUNT_FILE.tmp" "$ACCOUNT_FILE"
+    chmod 600 "$ACCOUNT_FILE"
+    echo "Опознание аккаунта обновлено → $ACCOUNT_FILE"
+  else
+    rm -f "$ACCOUNT_FILE.tmp"
+    echo "ВНИМАНИЕ: не удалось снять опознание из ~/.claude.json — новые контейнеры будут просить вход" >&2
+  fi
+  echo "Разложить по контейнерам: claude-dev-ctl retrofit <контейнер>"
 }
 
 cmd_save_codex_auth() { # $1 = контейнер, где выполнили `codex login`
@@ -492,6 +554,12 @@ doctor_host() {
     d_bad "нет $CREDS_FILE — новые контейнеры потребуют /login"
   fi
 
+  if [ -f "$ACCOUNT_FILE" ]; then
+    d_ok "опознание аккаунта Claude"
+  else
+    d_bad "нет $ACCOUNT_FILE — Claude попросит вход даже с валидным токеном (claude-dev-ctl save-creds <контейнер>)"
+  fi
+
   if [ -f "$CODEX_AUTH_FILE" ]; then
     age=$(age_days "$CODEX_AUTH_FILE")
     d_ok "мастер-логин codex: $(cred_info < "$CODEX_AUTH_FILE") (файлу $age дн.)"
@@ -544,6 +612,14 @@ doctor_container() {
     d_ok "логин Claude: $(docker exec -u dev "$n" cat /home/dev/.claude/.credentials.json 2>/dev/null | cred_info)"
   else
     d_bad "нет логина Claude — внутри потребуется /login"
+  fi
+
+  # Токена мало: без опознания в ~/.claude.json Claude всё равно уходит во вход,
+  # и выглядит это как «креды не сработали». Проверяем обе половины.
+  if docker exec -u dev "$n" bash -lc 'grep -q "\"oauthAccount\"" ~/.claude.json 2>/dev/null'; then
+    d_ok "опознание аккаунта в ~/.claude.json"
+  else
+    d_bad "в ~/.claude.json нет oauthAccount — Claude попросит вход, хотя токен на месте (claude-dev-ctl retrofit $n)"
   fi
 
   if docker exec -u dev "$n" test -s /home/dev/.codex/auth.json 2>/dev/null; then

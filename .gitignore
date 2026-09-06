@@ -12,10 +12,12 @@ host_keys/
 # Креды и токены, которые кит раскладывает по контейнерам.
 # Живут только на хосте, в /root/claude-dev-build.
 claude-credentials.json
+claude-account.json
 codex-auth.json
 auth.json
 *_token
 *.token
+state/
 
 # Локальные настройки Claude Code — у каждого свои.
 .claude/settings.local.json

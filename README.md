@@ -89,7 +89,8 @@ ssh omv chmod +x /usr/local/bin/claude-dev-ctl
 | `mac_authorized_key` | публичный ключ Mac — вход в контейнеры |
 | `keys/id_dev_to_omv` | приватный ключ контейнера на хост (пользователь `deployer`) |
 | `keys/id_github` | ключ для `git clone/push` |
-| `claude-credentials.json` | креды Claude, чтобы не логиниться в каждом контейнере |
+| `claude-credentials.json` | токен Claude, чтобы не логиниться в каждом контейнере |
+| `claude-account.json` | опознание аккаунта Claude — вторая половина логина |
 | `codex-auth.json` | креды codex (`~/.codex/auth.json`) |
 | `arcane_container_token` | API-ключ Arcane (UI → Settings → API keys) |
 
@@ -130,6 +131,27 @@ ssh omv claude-dev-ctl deploy myproj 2203
 засеваются ключи, креды Claude и codex, `CLAUDE.md` и скиллы.
 
 Дальше — `Enter` в панели: `ssh` + `tmux new -A -s work` в `/workspace`.
+
+---
+
+## Авторизация Claude
+
+Новый контейнер стартует уже залогиненным — логин переносится с хоста. Обновить мастер
+после релогина:
+
+```bash
+ssh omv claude-dev-ctl save-creds dev-myproj
+ssh omv claude-dev-ctl retrofit dev-другой
+```
+
+Логин — это **два** файла, и одного мало: токен в `~/.claude/.credentials.json` и
+опознание аккаунта в `~/.claude.json`. Без второго Claude открывает вход, хотя валидный
+токен лежит рядом, — и выглядит это как «креды не сработали». `save-creds` снимает обе
+половины разом, `doctor` проверяет обе; опознание подмешивается в `~/.claude.json`, не
+трогая остального — `machineID` и доверенные каталоги там про конкретную машину.
+
+> Лимит одновременных сессий Max/Pro никуда не девается: один аккаунт на несколько
+> контейнеров означает несколько сессий под ним.
 
 ---
 

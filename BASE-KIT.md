@@ -70,13 +70,23 @@ Claude Code, а результат перечитывает другая мод�
 | ключ на OMV-хост (deployer) | `~/.ssh/id_ed25519` | `keys/id_dev_to_omv` |
 | ключ GitHub | `~/.ssh/id_github` | `keys/id_github` |
 | `~/.ssh/config` | алиасы `omv`, IP хоста, `github.com` | генерируется |
-| креды Claude | `~/.claude/.credentials.json` | `claude-credentials.json` |
+| токен Claude | `~/.claude/.credentials.json` | `claude-credentials.json` (один раз) |
+| опознание аккаунта Claude | ключи в `~/.claude.json` | `claude-account.json` |
 | токен Arcane | `~/.arcane_token` | `arcane_container_token` |
 | креды codex | `~/.codex/auth.json` | `codex-auth.json` (один раз) |
 | настройки codex | `~/.codex/config.toml` | `codex-config.toml.template` (один раз) |
 | настройки ralphex | `~/.config/ralphex/config` | `ralphex-config.template` (один раз) |
 | правила для Claude | `~/.claude/CLAUDE.md` | `CLAUDE.md.template` |
 | скиллы Claude Code | `~/.claude/skills/` | `skills/` |
+
+Логин Claude — это **два** файла, и одного мало. Токен лежит в
+`~/.claude/.credentials.json`, а опознание аккаунта (`oauthAccount`, `userID`, отметка о
+пройденном онбординге) — в `~/.claude.json`. Без второго Claude уходит во вход, хотя
+валидный токен лежит рядом; выглядит это как «креды не сработали». Поэтому опознание
+держится отдельным мастер-файлом и подмешивается в `~/.claude.json` каждого контейнера,
+не затирая остального: `machineID` и доверенные каталоги там про конкретную машину.
+`claude-dev-ctl save-creds` снимает обе половины разом — снимать их порознь значит
+однажды забыть про вторую.
 
 Что переживает пересоздание контейнера: тома `/workspace`, `~/.claude`, `~/.codex`,
 `~/.config` (настройки ralphex, авторизация `gh`) и `~/.ssh`. Всё остальное в `$HOME`
