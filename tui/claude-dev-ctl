@@ -17,6 +17,7 @@ DEPLOYKEY=$BUILD_DIR/keys/id_dev_to_omv
 GITHUBKEY=$BUILD_DIR/keys/id_github                    # общий ключ для git clone/push
 CREDS_FILE=$BUILD_DIR/claude-credentials.json          # мастер-креды Claude (только на хосте, не в git!)
 ACCOUNT_FILE=$BUILD_DIR/claude-account.json            # опознание аккаунта для ~/.claude.json
+OAUTH_TOKEN_FILE=$BUILD_DIR/claude-oauth-token         # долгоживущий токен (claude setup-token)
 CODEX_AUTH_FILE=$BUILD_DIR/codex-auth.json             # мастер-креды codex (~/.codex/auth.json)
 ATOKEN_FILE=$BUILD_DIR/arcane_container_token          # общий Arcane-токен для dev-контейнеров
 CLAUDEMD_TPL=$BUILD_DIR/CLAUDE.md.template             # контекст ландшафта для Claude
@@ -282,10 +283,26 @@ seed_creds() { # CONTAINER MASTER DEST LABEL HINT
     && echo "  ✓ засеяно: $label — контейнер уже авторизован"
 }
 
-seed_login() { # авторизация Claude Code: токен + опознание аккаунта
+seed_login() { # авторизация Claude Code
   local c=$1
+
+  # Долгоживущий токен (claude setup-token) — единственный способ, которым логин
+  # действительно переносится между контейнерами. Копия ~/.claude/.credentials.json
+  # переносится лишь до первого обновления: refresh-токены ротируются, и контейнер,
+  # обновившийся первым, убивает копию у всех остальных — снаружи это выглядит как
+  # «креды не сработали», хотя файл на месте и даже не просрочен.
+  if [ -s "$OAUTH_TOKEN_FILE" ]; then
+    printf "export CLAUDE_CODE_OAUTH_TOKEN='%s'\n" "$(tr -d '[:space:]' < "$OAUTH_TOKEN_FILE")" \
+      | docker exec -i -u root "$c" bash -lc "cat > /home/dev/.claude_env" \
+      && docker exec -u root "$c" bash -lc "chown dev:dev /home/dev/.claude_env && chmod 600 /home/dev/.claude_env" \
+      && echo "  ✓ засеяно: долгоживущий токен Claude (не ротируется — переносится между контейнерами)"
+    return 0
+  fi
+
+  echo "  (нет $OAUTH_TOKEN_FILE — падаем на копию .credentials.json, она живёт до первого"
+  echo "   обновления токена в любом другом контейнере; сделай claude setup-token и положи вывод туда)"
   seed_creds "$c" "$CREDS_FILE" /home/dev/.claude/.credentials.json "логин Claude" \
-    "потребуется /login; обнови мастер: claude-dev-ctl save-creds <залогиненный-контейнер>"
+    "потребуется вход; обнови мастер: claude-dev-ctl save-creds <залогиненный-контейнер>"
 
   if [ ! -f "$ACCOUNT_FILE" ]; then
     echo "  (нет $ACCOUNT_FILE — Claude попросит войти, даже имея валидный токен;"
@@ -560,6 +577,14 @@ doctor_host() {
     d_bad "нет $ACCOUNT_FILE — Claude попросит вход даже с валидным токеном (claude-dev-ctl save-creds <контейнер>)"
   fi
 
+  if [ -s "$OAUTH_TOKEN_FILE" ]; then
+    d_ok "долгоживущий токен Claude — логин переносится между контейнерами"
+  else
+    d_bad "нет $OAUTH_TOKEN_FILE — новый контейнер получит копию .credentials.json, а она"
+    d_note "   умирает, как только любой другой контейнер обновит токен (refresh-токены ротируются)."
+    d_note "   Лечится один раз: в контейнере \`claude setup-token\`, вывод — в этот файл."
+  fi
+
   if [ -f "$CODEX_AUTH_FILE" ]; then
     age=$(age_days "$CODEX_AUTH_FILE")
     d_ok "мастер-логин codex: $(cred_info < "$CODEX_AUTH_FILE") (файлу $age дн.)"
@@ -608,18 +633,25 @@ doctor_container() {
     d_bad "нет инструментов: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g; s/ $//') — пересоздай контейнер на свежем образе"
   fi
 
-  if docker exec -u dev "$n" test -s /home/dev/.claude/.credentials.json 2>/dev/null; then
-    d_ok "логин Claude: $(docker exec -u dev "$n" cat /home/dev/.claude/.credentials.json 2>/dev/null | cred_info)"
-  else
-    d_bad "нет логина Claude — внутри потребуется /login"
-  fi
+  # Наличие файла с токеном ничего не доказывает: он может быть на месте, не просрочен
+  # и всё равно отвергнут — так бывает с копией, чей refresh-токен уже ротирован в
+  # другом контейнере. Спрашиваем сам claude, а не разглядываем файлы.
+  out=$(docker exec -u dev "$n" bash -lc 'timeout 60 claude auth status 2>/dev/null' 2>/dev/null)
+  case "$out" in
+    *'"loggedIn": true'*)
+      d_ok "Claude авторизован: $(printf '%s' "$out" | sed -n 's/.*"subscriptionType": *"\([^"]*\)".*/\1/p'), $(printf '%s' "$out" | sed -n 's/.*"authMethod": *"\([^"]*\)".*/\1/p')" ;;
+    *'"loggedIn": false'*)
+      d_bad "Claude НЕ авторизован — при запуске попросит вход (claude-dev-ctl retrofit $n --force)" ;;
+    "")
+      d_bad "claude auth status не ответил за 60 с" ;;
+    *)
+      d_bad "claude auth status вернул неожиданное: ${out%%$'\n'*}" ;;
+  esac
 
-  # Токена мало: без опознания в ~/.claude.json Claude всё равно уходит во вход,
-  # и выглядит это как «креды не сработали». Проверяем обе половины.
-  if docker exec -u dev "$n" bash -lc 'grep -q "\"oauthAccount\"" ~/.claude.json 2>/dev/null'; then
-    d_ok "опознание аккаунта в ~/.claude.json"
+  if docker exec -u dev "$n" test -s /home/dev/.claude_env 2>/dev/null; then
+    d_note "логин через долгоживущий токен (переносится между контейнерами)"
   else
-    d_bad "в ~/.claude.json нет oauthAccount — Claude попросит вход, хотя токен на месте (claude-dev-ctl retrofit $n)"
+    d_note "логин через копию .credentials.json — умрёт, как только токен обновит другой контейнер"
   fi
 
   if docker exec -u dev "$n" test -s /home/dev/.codex/auth.json 2>/dev/null; then

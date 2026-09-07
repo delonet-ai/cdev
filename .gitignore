@@ -13,6 +13,7 @@ host_keys/
 # Живут только на хосте, в /root/claude-dev-build.
 claude-credentials.json
 claude-account.json
+claude-oauth-token
 codex-auth.json
 auth.json
 *_token

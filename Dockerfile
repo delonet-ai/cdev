@@ -150,7 +150,16 @@ RUN mkdir -p /etc/ssh/sshd_config.d \
 # на native и возникали "Multiple installations" + "npm global folder isn't writable".
 USER dev
 RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && printf '\n# Интерактивный вход — сразу в /workspace: там код проекта.\n# В $HOME лежат ключи и креды, которым нечего делать в рабочем контексте Claude.\ncd /workspace 2>/dev/null || true\n' >> /home/dev/.bashrc
+    && printf '%s\n' \
+      '' \
+      '# Токен Claude Code. Дублирует /etc/profile.d/claude-env.sh: тот читают login-шеллы,' \
+      '# этот — интерактивные без login (например, панель, открывающая шелл внутри tmux).' \
+      '[ -r "$HOME/.claude_env" ] && . "$HOME/.claude_env"' \
+      '' \
+      '# Интерактивный вход — сразу в /workspace: там код проекта.' \
+      '# В $HOME лежат ключи и креды, которым нечего делать в рабочем контексте Claude.' \
+      'cd /workspace 2>/dev/null || true' \
+      >> /home/dev/.bashrc
 USER root
 
 # claude лежит в ~/.local/bin, а туда PATH попадает только у login-шелла: у Debian это
@@ -158,6 +167,16 @@ USER root
 # упирались в "command not found". Прописываем путь в образ, чтобы бинарь находился
 # из любого шелла, а не только из того, куда пользователь зашёл руками.
 ENV PATH=/home/dev/.local/bin:$PATH
+
+# Долгоживущий токен Claude (claude setup-token) кладётся в ~/.claude_env при deploy.
+# Подхватываем его из /etc/profile.d, а не из ~/.bashrc: у Debian .bashrc в самом
+# начале выходит для неинтерактивных шеллов, поэтому `bash -lc` — а это и ralphex, и
+# docker exec — переменной бы не увидел. /etc/profile читают все login-шеллы.
+RUN printf '%s\n' \
+      '# Токен Claude Code: файл засевается claude-dev-ctl, в образе его нет.' \
+      '[ -r "$HOME/.claude_env" ] && . "$HOME/.claude_env"' \
+      > /etc/profile.d/claude-env.sh \
+    && chmod 644 /etc/profile.d/claude-env.sh
 
 # docker CLI без локального демона: все команды идут на OMV-хост по SSH под deployer.
 # Значит `docker ps` здесь показывает контейнеры СЕРВЕРА (включая прод) — правила
