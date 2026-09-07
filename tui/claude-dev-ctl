@@ -336,6 +336,10 @@ cmd_retrofit() { # применить токен/CLAUDE.md/ревьюера к �
   docker inspect "$cname" >/dev/null 2>&1 || { echo "Нет контейнера $cname"; exit 1; }
   echo "Обновляю контекст в $cname:"
   seed_context "$cname"
+  echo
+  echo "Проверка авторизации:"
+  check_claude_auth "$cname"
+  check_codex_auth "$cname"
 }
 
 write_compose() { # $1 = имя проекта (без dev-), $2 = порт → печатает путь к compose-файлу
@@ -385,6 +389,19 @@ cmd_deploy() {
   [ -f "$MACKEY_FILE" ] || { echo "Нет $MACKEY_FILE (ключ Mac). Переустанови cdev."; exit 1; }
   [ -f "$DEPLOYKEY" ]   || { echo "Нет deploy-ключа $DEPLOYKEY"; exit 1; }
 
+  # Предупреждаем до создания, а не после: без долгоживущего токена контейнер
+  # получит копию сессионных кред, и она отвалится при первом же обновлении токена
+  # в любом другом контейнере. Не блокируем — копия какое-то время работает, — но
+  # сказать об этом надо до того, как человек уйдёт работать.
+  if [ ! -s "$OAUTH_TOKEN_FILE" ]; then
+    echo "ВНИМАНИЕ: нет $OAUTH_TOKEN_FILE."
+    echo "  Контейнер получит копию .credentials.json. Refresh-токены Claude ротируются:"
+    echo "  первый же контейнер, обновивший токен, обесценит эту копию, и тут попросят вход."
+    echo "  Один раз лечится так: в любом залогиненном контейнере \`claude setup-token\`,"
+    echo "  вывод — в $OAUTH_TOKEN_FILE, дальше все контейнеры берут его оттуда."
+    echo
+  fi
+
   file=$(write_compose "$name" "$port") || { echo "Не удалось записать compose-файл"; exit 1; }
   # Тома, созданные не compose'ом (например, ещё Portainer'ом), отличаются меткой
   # config-hash — и compose спрашивает «пересоздать? данные будут потеряны». В томе
@@ -427,12 +444,25 @@ cmd_deploy() {
     sleep 0.5
   done
 
-  if [ "$ready" = 1 ]; then
-    echo "OK: $cname развёрнут на порту $port."
-    echo "Подключение: ssh -p $port dev@$HOST_IP   (внутри: claude)"
-  else
+  if [ "$ready" != 1 ]; then
     echo "ВНИМАНИЕ: $cname создан, но sshd не поднялся за 30 с."
     echo "Проверь: docker logs $cname"
+    return 0
+  fi
+
+  # Спрашиваем самих агентов, авторизованы ли они. Раскладывание файлов — не то же
+  # самое, что рабочий логин: копия кред бывает на месте, не просрочена и отвергнута.
+  # Узнать об этом лучше сейчас, чем когда человек уже сел работать.
+  echo
+  echo "Проверка авторизации:"
+  check_claude_auth "$cname"
+  check_codex_auth "$cname"
+
+  echo
+  echo "OK: $cname развёрнут на порту $port."
+  echo "Подключение: ssh -p $port dev@$HOST_IP   (внутри: claude)"
+  if [ "$DOC_FAIL" = 1 ]; then
+    echo "Но авторизация неполная — см. ✗ выше; чинится claude-dev-ctl retrofit $cname --force"
   fi
 }
 
@@ -615,6 +645,60 @@ doctor_host() {
   echo
 }
 
+# Срок жизни access-токена codex. Читаем exp прямо из JWT: `codex login status`
+# отвечает «Logged in», не сходив в сеть, — он говорил так с токеном, истёкшим
+# тремя днями раньше, и на такой ответ нельзя опираться.
+CODEX_EXP_JS='
+const fs = require("fs");
+let j;
+try { j = JSON.parse(fs.readFileSync(process.env.HOME + "/.codex/auth.json", "utf8")); }
+catch (e) { console.log("нет"); process.exit(0); }
+const t = (j.tokens || {}).access_token;
+if (!t) { console.log("нет"); process.exit(0); }
+let exp = 0;
+try { exp = JSON.parse(Buffer.from(t.split(".")[1], "base64url").toString("utf8")).exp * 1000; } catch (e) {}
+const when = exp ? new Date(exp).toISOString().slice(0, 16).replace("T", " ") : "-";
+console.log((j.auth_mode || "?") + " " + (exp ? (exp < Date.now() ? "expired" : "valid") : "unknown") + " " + when);
+'
+
+check_claude_auth() { # CONTAINER — реальная проверка, а не наличие файла
+  local n=$1 out
+  out=$(docker exec -u dev "$n" bash -lc 'timeout 60 claude auth status 2>/dev/null' 2>/dev/null)
+  case "$out" in
+    *'"loggedIn": true'*)
+      d_ok "Claude авторизован: $(printf '%s' "$out" | sed -n 's/.*"subscriptionType": *"\([^"]*\)".*/\1/p'), $(printf '%s' "$out" | sed -n 's/.*"authMethod": *"\([^"]*\)".*/\1/p')" ;;
+    *'"loggedIn": false'*)
+      d_bad "Claude НЕ авторизован — при запуске попросит вход" ;;
+    "")
+      d_bad "claude auth status не ответил за 60 с" ;;
+    *)
+      d_bad "claude auth status вернул неожиданное: ${out%%$'\n'*}" ;;
+  esac
+
+  if docker exec -u dev "$n" test -s /home/dev/.claude_env 2>/dev/null; then
+    d_note "  через долгоживущий токен — переносится между контейнерами"
+  else
+    d_note "  через копию .credentials.json — умрёт, как только токен обновит другой контейнер"
+  fi
+}
+
+check_codex_auth() { # CONTAINER
+  local n=$1 out mode state when
+  out=$(docker exec -u dev "$n" node -e "$CODEX_EXP_JS" 2>/dev/null)
+  read -r mode state when <<< "$out"
+  case "$mode" in
+    нет|"") d_bad "нет логина codex — фаза внешнего ревью в ralphex не пройдёт" ;;
+    *)
+      if [ "$state" = valid ]; then
+        d_ok "codex авторизован: $mode, токен до $when"
+      else
+        # Не поломка: codex обновится при первом обращении, и — в отличие от Claude —
+        # переживший ротацию токен у соседних контейнеров при этом не умирает.
+        d_note "codex: $mode, access-токен истёк ($when) — обновится при первом обращении"
+      fi ;;
+  esac
+}
+
 doctor_container() {
   local n=$1 st pt out
   st=$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo gone)
@@ -636,29 +720,9 @@ doctor_container() {
   # Наличие файла с токеном ничего не доказывает: он может быть на месте, не просрочен
   # и всё равно отвергнут — так бывает с копией, чей refresh-токен уже ротирован в
   # другом контейнере. Спрашиваем сам claude, а не разглядываем файлы.
-  out=$(docker exec -u dev "$n" bash -lc 'timeout 60 claude auth status 2>/dev/null' 2>/dev/null)
-  case "$out" in
-    *'"loggedIn": true'*)
-      d_ok "Claude авторизован: $(printf '%s' "$out" | sed -n 's/.*"subscriptionType": *"\([^"]*\)".*/\1/p'), $(printf '%s' "$out" | sed -n 's/.*"authMethod": *"\([^"]*\)".*/\1/p')" ;;
-    *'"loggedIn": false'*)
-      d_bad "Claude НЕ авторизован — при запуске попросит вход (claude-dev-ctl retrofit $n --force)" ;;
-    "")
-      d_bad "claude auth status не ответил за 60 с" ;;
-    *)
-      d_bad "claude auth status вернул неожиданное: ${out%%$'\n'*}" ;;
-  esac
+  check_claude_auth "$n"
 
-  if docker exec -u dev "$n" test -s /home/dev/.claude_env 2>/dev/null; then
-    d_note "логин через долгоживущий токен (переносится между контейнерами)"
-  else
-    d_note "логин через копию .credentials.json — умрёт, как только токен обновит другой контейнер"
-  fi
-
-  if docker exec -u dev "$n" test -s /home/dev/.codex/auth.json 2>/dev/null; then
-    d_ok "логин codex: $(docker exec -u dev "$n" cat /home/dev/.codex/auth.json 2>/dev/null | cred_info)"
-  else
-    d_bad "нет логина codex — фаза внешнего ревью в ralphex не пройдёт"
-  fi
+  check_codex_auth "$n"
 
   out=$(docker exec -u dev "$n" bash -lc '
     for f in ~/.claude/CLAUDE.md ~/.codex/config.toml ~/.config/ralphex/config; do

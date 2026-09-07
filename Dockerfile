@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dnsutils \
       iputils-ping \
       netcat-openbsd \
+      bubblewrap \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
